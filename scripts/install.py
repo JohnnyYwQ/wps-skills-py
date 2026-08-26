@@ -103,6 +103,7 @@ def check_files():
     files = [
         ("SKILL.md", "技能定义文件"),
         ("bridge/action_trace.py", "Action 结构化追踪与 24 小时保留"),
+        ("bridge/service_lifecycle.py", "bridge 实例身份与生命周期"),
         ("bridge/server.py", "统一桥接服务"),
         ("bridge/wps_excel.py", "WPS Excel 控制器"),
         ("bridge/wps_ppt.py", "WPS PPT 控制器"),
@@ -111,6 +112,8 @@ def check_files():
         ("bridge/linux_excel.py", "Linux Excel 后端（openpyxl）"),
         ("bridge/linux_ppt.py", "Linux PPT 后端（OpenXML）"),
         ("bridge/linux_word.py", "Linux Word 后端（OpenXML）"),
+        ("scripts/call.py", "Action 调用入口"),
+        ("scripts/service.py", "bridge 生命周期命令"),
         ("vendor/openpyxl/__init__.py", "vendored openpyxl（Linux Excel 后端依赖，无需 pip）"),
         ("vendor/et_xmlfile/__init__.py", "vendored et_xmlfile（openpyxl 依赖）"),
         ("config.json", "配置文件"),
@@ -138,15 +141,15 @@ def show_usage():
     print("  1. 调用 Action（会自动启动桥接服务）：")
     print("     python scripts/call.py getContext '{}'")
     print()
-    print("  2. 如需前台运行桥接服务：")
-    print("     python scripts/start.py")
+    print("  2. 查看或停止桥接服务：")
+    print("     python scripts/service.py status")
+    print("     python scripts/service.py stop")
     print()
     print("  3. 测试连接：")
     print("     python scripts/test.py")
     print()
-    print("  4. HTTP POST 调用方式：")
-    print("     POST http://127.0.0.1:58891/dispatch")
-    print('     {"action": "getContext", "params": {}}')
+    print("  4. 如需前台观察服务：")
+    print("     python scripts/start.py")
     print()
     print()
     print("=" * 60)

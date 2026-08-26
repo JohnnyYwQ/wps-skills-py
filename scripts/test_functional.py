@@ -2,20 +2,36 @@
 # -*- coding: utf-8 -*-
 """统一 WPS Skill 功能验证脚本（Excel / PPT / Word + 通用）。
 通过 scripts/call.py 的胶水层调用，会自动拉起最新桥接服务。"""
+import atexit
 import sys, os, json, time
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import call  # noqa: E402
+import service  # noqa: E402
 
 PORT = call.PORT
 _results = []
+_started_bridge = False
+
+
+def _cleanup_started_bridge():
+    if not _started_bridge:
+        return
+    result = service.stop()
+    print(f"\n=== bridge 清理 ===\n{json.dumps(result, ensure_ascii=False)}")
+
+
+atexit.register(_cleanup_started_bridge)
 
 def run(label, action, params=None):
+    global _started_bridge
     params = params or {}
-    if not call._ensure_server():
+    bridge_service = call._ensure_server()
+    if not bridge_service:
         _results.append((label, False, {"error": "server start failed"}))
         return
+    _started_bridge = _started_bridge or bridge_service.started
     try:
-        r = call._post(action, params)
+        r = call._post(action, params, service_health=bridge_service.health)
     except Exception as e:
         r = {"success": False, "error": str(e)}
     ok = bool(r.get("success"))

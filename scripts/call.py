@@ -15,23 +15,71 @@ WPS 统一 Skill 调用入口（胶水层）
   3. POST action 到 http://127.0.0.1:58891/dispatch 并返回 JSON 结果
 """
 
+from dataclasses import dataclass
+import errno
 import sys
 import os
 import json
+import socket
 import time
 import subprocess
 import urllib.request
 import urllib.error
-
-HOST = "127.0.0.1"
-PORT = 58891
-BASE = f"http://{HOST}:{PORT}"
 
 BRIDGE_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "bridge")
 if BRIDGE_DIR not in sys.path:
     sys.path.insert(0, BRIDGE_DIR)
 
 from action_trace import ActionTrace, server_log_path
+from service_lifecycle import (
+    ServiceStartResult,
+    bridge_host,
+    bridge_port,
+    current_service_identity,
+    inspect_health,
+)
+
+
+HOST = bridge_host()
+PORT = bridge_port()
+BASE = f"http://{HOST}:{PORT}"
+_LOOPBACK_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+
+def _urlopen(request, timeout):
+    """直连 loopback bridge，不继承 HTTP_PROXY/HTTPS_PROXY。"""
+    return _LOOPBACK_OPENER.open(request, timeout=timeout)
+
+
+@dataclass(frozen=True)
+class HealthProbe:
+    state: str
+    health: object = None
+    error: str = None
+
+
+def _as_health_probe(value):
+    """兼容测试/旧内部调用传入的 dict/None。"""
+    if isinstance(value, HealthProbe):
+        return value
+    if value is None:
+        return HealthProbe("absent")
+    return HealthProbe("responded", health=value)
+
+
+def _is_connection_refused(exc):
+    refused_codes = {errno.ECONNREFUSED, 10061}
+    current = exc
+    for _ in range(3):
+        if isinstance(current, ConnectionRefusedError):
+            return True
+        if getattr(current, "errno", None) in refused_codes:
+            return True
+        reason = getattr(current, "reason", None)
+        if reason is None or reason is current:
+            break
+        current = reason
+    return False
 
 
 def _project_root():
@@ -43,37 +91,125 @@ def _server_path():
     return os.path.join(_project_root(), "bridge", "server.py")
 
 
-def _health():
+def _health(with_state=False):
     try:
-        with urllib.request.urlopen(f"{BASE}/health", timeout=2) as resp:
-            return json.loads(resp.read().decode("utf-8"))
+        with _urlopen(f"{BASE}/health", timeout=2) as resp:
+            raw = resp.read().decode("utf-8")
+        try:
+            probe = HealthProbe("responded", health=json.loads(raw))
+        except Exception as exc:
+            probe = HealthProbe(
+                "unhealthy",
+                error=f"bridge /health 返回非 JSON: {type(exc).__name__}: {exc}",
+            )
+    except urllib.error.HTTPError as exc:
+        try:
+            health = json.loads(exc.read().decode("utf-8"))
+            probe = HealthProbe("responded", health=health, error=f"HTTP {exc.code}")
+        except Exception:
+            probe = HealthProbe("unhealthy", error=f"bridge /health 返回 HTTP {exc.code}")
+        finally:
+            exc.close()
+    except Exception as exc:
+        if _is_connection_refused(exc):
+            probe = HealthProbe("absent", error=str(exc))
+        else:
+            probe = HealthProbe(
+                "unresponsive",
+                error=f"{type(exc).__name__}: {exc}",
+            )
+    return probe if with_state else probe.health
+
+
+def _is_healthy(h, expected=None):
+    """只有 checkout 与运行时代码都匹配的 bridge 才可复用。"""
+    return inspect_health(h, expected=expected).reusable
+
+
+def _terminate_started_process(process, wait_seconds=3):
+    """回收本次调用亲自启动但未就绪的进程；不触碰已有陌生实例。"""
+    if process is None:
+        return
+    try:
+        if process.poll() is not None:
+            return
     except Exception:
-        return None
-
-
-def _is_healthy(h):
-    """桥接服务 /health 返回 {"status":"ok"}；兼容旧版 {"success":true}。"""
-    return bool(h and (h.get("status") == "ok" or h.get("success")))
+        # poll 本身失败时无法证明子进程已退出，继续做有界回收。
+        pass
+    try:
+        process.terminate()
+        process.wait(timeout=wait_seconds)
+        return
+    except subprocess.TimeoutExpired:
+        pass
+    except Exception:
+        pass
+    try:
+        process.kill()
+        process.wait(timeout=wait_seconds)
+    except Exception:
+        pass
 
 
 def _ensure_server(trace=None):
-    """确保桥接服务在运行；未运行则后台拉起。返回是否成功。"""
+    """确保当前 checkout 的 bridge 在运行；绝不复用身份不明的服务。"""
     started = time.perf_counter()
-    if _is_healthy(_health()):
+    expected = current_service_identity()
+    probe = _as_health_probe(_health(with_state=True))
+    health = probe.health
+    if probe.state in ("unresponsive", "unhealthy"):
+        error = (
+            "bridge 端口存在但健康检查无响应，可能正在执行 Action 或已卡住；"
+            "为避免双开，拒绝启动第二实例"
+        )
+        if probe.error:
+            error = f"{error}: {probe.error}"
+        if trace:
+            trace.event(
+                "bridge.health.unavailable",
+                status="error",
+                state=probe.state,
+                error=error,
+            )
+        return ServiceStartResult(False, code="BRIDGE_UNAVAILABLE", error=error)
+    inspection = inspect_health(health, expected=expected)
+    if inspection.reusable:
         if trace:
             trace.event(
                 "bridge.health.checked",
                 status="healthy",
+                instanceId=health.get("instanceId"),
                 elapsedMs=round((time.perf_counter() - started) * 1000, 2),
             )
-        return True
+        return ServiceStartResult(True, health=health)
+    if probe.state == "responded":
+        inspection_error = inspection.error
+        if health is None:
+            inspection_error = "端口上的 /health 返回 JSON null，拒绝视为空闲端口"
+        if trace:
+            trace.event(
+                "bridge.instance.rejected",
+                status="error",
+                state=inspection.state,
+                error=inspection_error,
+                expectedProjectRoot=expected.get("projectRoot"),
+                actualProjectRoot=(health.get("projectRoot") if isinstance(health, dict) else None),
+                actualInstanceId=(health.get("instanceId") if isinstance(health, dict) else None),
+            )
+        return ServiceStartResult(
+            False,
+            code="BRIDGE_INSTANCE_MISMATCH",
+            error=inspection_error,
+            health=health if isinstance(health, dict) else None,
+        )
 
     py = sys.executable
     server = _server_path()
     if not os.path.exists(server):
+        error = f"找不到桥接服务: {server}"
         if trace:
-            trace.event("bridge.start.failed", status="error", error=f"找不到桥接服务: {server}")
-        return False
+            trace.event("bridge.start.failed", status="error", error=error)
+        return ServiceStartResult(False, code="BRIDGE_START_FAILED", error=error)
 
     log_path, log_warning = server_log_path()
     if trace:
@@ -86,6 +222,7 @@ def _ensure_server(trace=None):
             trace.event("bridge.log.warning", status="warning", warning=log_warning)
 
     log_stream = None
+    process = None
     try:
         if log_path is not None:
             log_stream = log_path.open("a", encoding="utf-8")
@@ -94,7 +231,7 @@ def _ensure_server(trace=None):
         if os.name == "nt":
             si = subprocess.STARTUPINFO()
             si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-            subprocess.Popen(
+            process = subprocess.Popen(
                 [py, server],
                 stdout=stdout_target,
                 stderr=stderr_target,
@@ -102,16 +239,17 @@ def _ensure_server(trace=None):
                 startupinfo=si,
             )
         else:
-            subprocess.Popen(
+            process = subprocess.Popen(
                 [py, server],
                 stdout=stdout_target,
                 stderr=stderr_target,
                 start_new_session=True,
             )
     except Exception as e:
+        error = f"启动桥接服务失败: {e}"
         if trace:
-            trace.event("bridge.start.failed", status="error", error=f"启动桥接服务失败: {e}")
-        return False
+            trace.event("bridge.start.failed", status="error", error=error)
+        return ServiceStartResult(False, code="BRIDGE_START_FAILED", error=error)
     finally:
         if log_stream is not None:
             log_stream.close()
@@ -119,26 +257,67 @@ def _ensure_server(trace=None):
     # 轮询等待服务就绪（最多 ~10s）
     for _ in range(40):
         time.sleep(0.25)
-        if _is_healthy(_health()):
+        probe = _as_health_probe(_health(with_state=True))
+        health = probe.health
+        inspection = inspect_health(health, expected=expected)
+        if inspection.reusable:
             if trace:
                 trace.event(
                     "bridge.start.completed",
                     status="healthy",
+                    processPid=getattr(process, "pid", None),
+                    instanceId=health.get("instanceId"),
                     elapsedMs=round((time.perf_counter() - started) * 1000, 2),
                 )
-            return True
+            return ServiceStartResult(True, health=health, started=True)
+        if probe.state == "responded":
+            inspection_error = inspection.error
+            if health is None:
+                inspection_error = "端口上的 /health 返回 JSON null，拒绝视为空闲端口"
+            _terminate_started_process(process)
+            if trace:
+                trace.event(
+                    "bridge.start.conflicted",
+                    status="error",
+                    state=inspection.state,
+                    error=inspection_error,
+                    actualInstanceId=(health.get("instanceId") if isinstance(health, dict) else None),
+                )
+            return ServiceStartResult(
+                False,
+                code="BRIDGE_INSTANCE_MISMATCH",
+                error=inspection_error,
+                health=health if isinstance(health, dict) else None,
+            )
+        try:
+            process_exit_code = process.poll() if process is not None else None
+        except Exception:
+            process_exit_code = None
+        if process_exit_code is not None:
+            error = f"桥接服务启动后提前退出（exit={process_exit_code}），请检查 server 日志"
+            if trace:
+                trace.event("bridge.start.failed", status="error", error=error)
+            return ServiceStartResult(False, code="BRIDGE_START_EXITED", error=error)
+
+    _terminate_started_process(process)
+    error = "桥接服务启动超时，已回收本次启动的后台进程"
     if trace:
         trace.event(
             "bridge.start.failed",
             status="timeout",
+            error=error,
             elapsedMs=round((time.perf_counter() - started) * 1000, 2),
             serverLog=str(log_path) if log_path else None,
         )
-    return False
+    return ServiceStartResult(False, code="BRIDGE_START_TIMEOUT", error=error)
 
 
-def _post(action, params, app=None, trace=None):
+def _post(action, params, app=None, trace=None, service_health=None):
     trace = trace or ActionTrace.start(component="call")
+    service_health = service_health or _health()
+    inspection = inspect_health(service_health)
+    if not inspection.reusable:
+        raise RuntimeError(inspection.error or "bridge 实例身份校验失败")
     payload = {"traceId": trace.trace_id, "action": action, "params": params}
     if app:
         payload["app"] = app
@@ -149,6 +328,8 @@ def _post(action, params, app=None, trace=None):
         headers={
             "Content-Type": "application/json",
             "X-WPS-Trace-Id": trace.trace_id,
+            "X-WPS-Bridge-Project-Id": service_health["projectId"],
+            "X-WPS-Bridge-Instance-Id": service_health["instanceId"],
         },
     )
     trace.event(
@@ -162,9 +343,24 @@ def _post(action, params, app=None, trace=None):
     )
     started = time.perf_counter()
     try:
-        with urllib.request.urlopen(req, timeout=120) as resp:
+        with _urlopen(req, timeout=120) as resp:
             result = json.loads(resp.read().decode("utf-8"))
             http_status = getattr(resp, "status", 200)
+    except urllib.error.HTTPError as exc:
+        http_status = exc.code
+        try:
+            result = json.loads(exc.read().decode("utf-8"))
+        except Exception as parse_exc:
+            trace.event(
+                "http.request.failed",
+                status="error",
+                action=action,
+                error=f"HTTP {exc.code} 返回非 JSON: {parse_exc}",
+                elapsedMs=round((time.perf_counter() - started) * 1000, 2),
+            )
+            raise RuntimeError(f"bridge HTTP {exc.code} 返回非 JSON") from parse_exc
+        finally:
+            exc.close()
     except Exception as exc:
         trace.event(
             "http.request.failed",
@@ -281,10 +477,12 @@ def main():
         **trace.debug_fields(params=params),
     )
 
-    if not _ensure_server(trace=trace):
+    service = _ensure_server(trace=trace)
+    if not service:
         result = {
             "success": False,
-            "error": "桥接服务启动失败，请检查 traceLog 与 server 日志",
+            "code": service.code,
+            "error": service.error or "桥接服务启动失败，请检查 traceLog 与 server 日志",
         }
         trace.event(
             "action.completed",
@@ -296,7 +494,13 @@ def main():
         sys.exit(1)
 
     try:
-        result = _post(action, params, app=app, trace=trace)
+        result = _post(
+            action,
+            params,
+            app=app,
+            trace=trace,
+            service_health=service.health,
+        )
     except urllib.error.URLError as e:
         result = {"success": False, "error": f"调用失败（服务无响应）: {e}"}
         trace.event(

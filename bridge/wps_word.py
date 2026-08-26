@@ -18,6 +18,8 @@ import queue
 import threading
 from typing import Any, Dict, Optional
 
+from service_lifecycle import stop_line_process
+
 IS_WINDOWS = platform.system() == "Windows"
 IS_LINUX = platform.system() == "Linux"
 IS_MACOS = platform.system() == "Darwin"
@@ -801,15 +803,12 @@ class WpsWordController:
         except Exception: return False
 
     def close(self):
-        if self._stop is not None: self._stop.set()
-        try:
-            if self._ps_process and self._ps_process.stdin:
-                try: self._ps_process.stdin.write("EXIT\n"); self._ps_process.stdin.flush()
-                except Exception: pass
-                if self._ps_process.poll() is None: self._ps_process.kill()
-        except Exception: pass
-        finally:
-            self._ps_process = None
+        self._ready = False
+        stop_event = getattr(self, "_stop", None)
+        if stop_event is not None: stop_event.set()
+        process = getattr(self, "_ps_process", None)
+        self._ps_process = None
+        stop_line_process(process)
         if hasattr(self, '_ps_script') and self._ps_script:
             try: os.unlink(self._ps_script.name)
             except Exception: pass

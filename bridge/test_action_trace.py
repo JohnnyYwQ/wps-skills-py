@@ -56,6 +56,37 @@ class ActionTraceTests(unittest.TestCase):
 
             self.assertEqual({}, trace.debug_fields(params={"text": "private"}))
 
+    def test_manual_debug_switch_applies_without_environment_override(self):
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(
+            os.environ,
+            {"WPS_TRACE_DIR": tmp, "WPS_TRACE": ""},
+            clear=False,
+        ), patch.object(
+            action_trace,
+            "TRACE_LEVEL",
+            "debug",
+        ):
+            trace = ActionTrace.start(component="call")
+            fields = trace.debug_fields(params={"dataRange": "A1:B10"})
+
+            self.assertEqual("debug", trace.trace_level)
+            self.assertEqual("A1:B10", fields["params"]["dataRange"])
+
+    def test_environment_trace_level_overrides_manual_switch(self):
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(
+            os.environ,
+            {"WPS_TRACE_DIR": tmp, "WPS_TRACE": "info"},
+            clear=False,
+        ), patch.object(
+            action_trace,
+            "TRACE_LEVEL",
+            "debug",
+        ):
+            trace = ActionTrace.start(component="call")
+
+            self.assertEqual("info", trace.trace_level)
+            self.assertEqual({}, trace.debug_fields(params={"dataRange": "A1:B10"}))
+
     def test_debug_mode_redacts_secrets_and_summarizes_document_content(self):
         with tempfile.TemporaryDirectory() as tmp, patch.dict(
             os.environ,

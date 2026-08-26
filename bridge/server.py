@@ -15,6 +15,8 @@ import json
 import re
 import sys
 import os
+import signal
+import socket
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -27,11 +29,20 @@ import wps_excel
 import wps_ppt
 import wps_word
 from action_trace import ActionTrace
+from service_lifecycle import (
+    BridgeLifecycle,
+    bridge_host,
+    bridge_port,
+    configured_idle_timeout,
+    new_service_identity,
+)
 
-HOST = "127.0.0.1"
-PORT = 58891
+HOST = bridge_host()
+PORT = bridge_port()
 
 EXEC_TIMEOUT = 60
+MAX_REQUEST_BYTES = 16 * 1024 * 1024
+REQUEST_IO_TIMEOUT_SECONDS = 10
 
 # 从各控制器内嵌的 PS 脚本中解析出支持的 action 列表
 def _actions_from_module(mod):
@@ -366,22 +377,109 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         parsed = urlparse(self.path)
         if parsed.path == "/health":
-            self._send({"status": "ok"})
+            self._send(self.server.lifecycle.health_snapshot())
         elif parsed.path == "/actions":
             actions = get_action_list()
             self._send({"actions": actions, "count": len(actions)})
         else:
-            self._send({"error": "not found", "routes": ["/dispatch", "/health", "/actions"]}, 404)
+            self._send(
+                {
+                    "error": "not found",
+                    "routes": ["/dispatch", "/shutdown", "/health", "/actions"],
+                },
+                404,
+            )
 
     def do_POST(self):
         parsed = urlparse(self.path)
-        if parsed.path != "/dispatch":
-            self._send({"error": "only /dispatch supports POST"}, 404)
+        if parsed.path == "/shutdown":
+            self._handle_shutdown()
             return
+        if parsed.path != "/dispatch":
+            self._send({"error": "only /dispatch and /shutdown support POST"}, 404)
+            return
+        identity_error = self._validate_instance_headers()
+        if identity_error:
+            self._send(identity_error[0], identity_error[1])
+            return
+        try:
+            self._handle_dispatch()
+        finally:
+            self.server.lifecycle.mark_action_completed()
+
+    def _validate_instance_headers(self):
+        lifecycle = self.server.lifecycle
+        identity = lifecycle.identity
+        if lifecycle.should_stop():
+            return ({
+                "success": False,
+                "code": "BRIDGE_SHUTTING_DOWN",
+                "error": "bridge 正在关闭，请稍后重试",
+            }, 503)
+        requested_project = self.headers.get("X-WPS-Bridge-Project-Id")
+        requested_instance = self.headers.get("X-WPS-Bridge-Instance-Id")
+        if requested_project != identity.get("projectId"):
+            return ({
+                "success": False,
+                "code": "BRIDGE_PROJECT_MISMATCH",
+                "error": "请求来自另一份 checkout 或缺少项目身份",
+            }, 409)
+        if requested_instance != identity.get("instanceId"):
+            return ({
+                "success": False,
+                "code": "STALE_BRIDGE_INSTANCE",
+                "error": "bridge 实例已变化，请重新执行健康检查",
+            }, 409)
+        return None
+
+    def _handle_shutdown(self):
+        identity_error = self._validate_instance_headers()
+        if identity_error:
+            self._send(identity_error[0], identity_error[1])
+            return
+        lifecycle = self.server.lifecycle
+        result = {
+            "success": True,
+            "status": "stopping",
+            "instanceId": lifecycle.identity["instanceId"],
+        }
+        try:
+            self._send(result, 202)
+        finally:
+            # 单线程 HTTPServer 不能在 handler 内调用 shutdown()；主循环会在
+            # 当前响应返回后观察到该标记并退出。
+            lifecycle.request_stop("api")
+
+    def _handle_dispatch(self):
         request_started = time.perf_counter()
         header_trace_id = self.headers.get("X-WPS-Trace-Id")
         try:
             length = int(self.headers.get("Content-Length", 0))
+        except (TypeError, ValueError) as exc:
+            trace = ActionTrace.resume(header_trace_id, component="server")
+            self._send(trace.decorate({
+                "success": False,
+                "code": "INVALID_CONTENT_LENGTH",
+                "error": f"Content-Length 无效: {exc}",
+            }), 400)
+            return
+        if length < 0:
+            trace = ActionTrace.resume(header_trace_id, component="server")
+            self._send(trace.decorate({
+                "success": False,
+                "code": "INVALID_CONTENT_LENGTH",
+                "error": "Content-Length 不能为负数",
+            }), 400)
+            return
+        if length > MAX_REQUEST_BYTES:
+            trace = ActionTrace.resume(header_trace_id, component="server")
+            self._send(trace.decorate({
+                "success": False,
+                "code": "REQUEST_TOO_LARGE",
+                "error": f"请求体超过 {MAX_REQUEST_BYTES} bytes 限制",
+            }), 413)
+            return
+        try:
             raw = self.rfile.read(length) if length else b"{}"
             payload = json.loads(raw.decode("utf-8") or "{}")
         except Exception as e:
@@ -451,24 +549,113 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, *args):
         pass  # 静默
 
+
+class BridgeHTTPServer(HTTPServer):
+    # Windows 的 SO_REUSEADDR 可能允许第二监听者抢占相同端口；Unix 保留
+    # reuse 以避免服务正常重启被 TIME_WAIT 阻断。
+    allow_reuse_address = os.name != "nt"
+
+    def __init__(self, server_address, handler_class, lifecycle):
+        self.lifecycle = lifecycle
+        super().__init__(server_address, handler_class)
+
+    def server_bind(self):
+        if os.name == "nt":
+            self.allow_reuse_address = False
+            exclusive = getattr(socket, "SO_EXCLUSIVEADDRUSE", None)
+            if exclusive is not None:
+                self.socket.setsockopt(socket.SOL_SOCKET, exclusive, 1)
+        super().server_bind()
+
+    def get_request(self):
+        connection, address = super().get_request()
+        connection.settimeout(REQUEST_IO_TIMEOUT_SECONDS)
+        return connection, address
+
+
+def serve_until_stopped(httpd, lifecycle, poll_interval=0.25):
+    """单线程请求循环；Action 执行期间不会并发触发 idle shutdown。"""
+    httpd.timeout = poll_interval
+    while not lifecycle.should_stop():
+        httpd.handle_request()
+    return lifecycle.stop_reason
+
+
+def _cleanup_controllers(cache=None):
+    cache = _controller_cache if cache is None else cache
+    if cache is _controller_cache:
+        with _controller_lock:
+            controllers = list(cache.values())
+            cache.clear()
+    else:
+        controllers = list(cache.values())
+        cache.clear()
+    for ctrl in controllers:
+        try:
+            ctrl.close()
+        except Exception:
+            pass
+
+
+def _install_signal_handlers(lifecycle):
+    previous = {}
+
+    def request_stop(signum, _frame):
+        try:
+            reason = f"signal:{signal.Signals(signum).name}"
+        except Exception:
+            reason = f"signal:{signum}"
+        lifecycle.request_stop_from_signal(reason)
+
+    for signum in (signal.SIGINT, signal.SIGTERM):
+        try:
+            previous[signum] = signal.signal(signum, request_stop)
+        except (ValueError, OSError):
+            continue
+    return previous
+
+
+def _restore_signal_handlers(previous):
+    for signum, handler in previous.items():
+        try:
+            signal.signal(signum, handler)
+        except (ValueError, OSError):
+            pass
+
+
 def main():
-    server = HTTPServer((HOST, PORT), Handler)
+    lifecycle = BridgeLifecycle(
+        identity=new_service_identity(),
+        idle_timeout_seconds=configured_idle_timeout(),
+    )
+    server = BridgeHTTPServer((HOST, PORT), Handler, lifecycle)
+    previous_handlers = _install_signal_handlers(lifecycle)
     print(f"WPS 统一桥接服务已启动: http://{HOST}:{PORT}", flush=True)
     print(f"  支持 action: Excel {len(EXCEL_ACTIONS)} + PPT {len(PPT_ACTIONS)} + Word {len(WORD_ACTIONS)}", flush=True)
-    print("  按 Ctrl+C 停止", flush=True)
+    print(
+        f"  PID: {os.getpid()} | instance: {lifecycle.identity['instanceId']}"
+        f" | idle timeout: {lifecycle.idle_timeout_seconds:g}s",
+        flush=True,
+    )
+    print("  按 Ctrl+C 或运行 python scripts/service.py stop 停止", flush=True)
     try:
-        server.serve_forever()
+        reason = serve_until_stopped(server, lifecycle)
+        print(f"bridge 正在停止: {reason}", flush=True)
     except KeyboardInterrupt:
-        print("\n服务已停止")
+        lifecycle.request_stop("keyboard_interrupt")
     finally:
-        # 清理所有控制器（关闭 PS 进程）
-        with _controller_lock:
-            for ctrl in _controller_cache.values():
-                try:
-                    ctrl.close()
-                except Exception:
-                    pass
-        server.server_close()
+        try:
+            # 先释放监听端口，阻止清理阶段继续积压请求；service.py 会继续按
+            # 原 PID 等待，直到 controller 清理完成、进程真正退出。
+            server.server_close()
+        finally:
+            try:
+                _cleanup_controllers()
+            finally:
+                # 清理期间继续保留安全的信号 handler，避免第二次 SIGTERM
+                # 直接打断 PowerShell/COM 的有界释放流程。
+                _restore_signal_handlers(previous_handlers)
+        print("服务已停止", flush=True)
 
 if __name__ == "__main__":
     main()

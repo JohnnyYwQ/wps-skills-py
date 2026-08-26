@@ -33,6 +33,31 @@ class _RunningProcess:
 
 
 class ControllerTraceTests(unittest.TestCase):
+    def test_controller_close_waits_for_clean_powershell_exit(self):
+        controller_types = (
+            wps_excel.WpsExcelController,
+            wps_ppt.WpsPptController,
+            wps_word.WpsWordController,
+        )
+        for controller_type in controller_types:
+            with self.subTest(controller=controller_type.__name__):
+                process = Mock()
+                process.stdin = _InputCapture()
+                process.poll.return_value = None
+                process.wait.return_value = 0
+                controller = object.__new__(controller_type)
+                controller._ps_process = process
+                controller._ready = True
+                controller._stop = threading.Event()
+
+                controller.close()
+
+                self.assertIn("EXIT\n", process.stdin.lines)
+                process.wait.assert_called_once()
+                process.kill.assert_not_called()
+                self.assertFalse(controller._ready)
+                self.assertIsNone(controller._ps_process)
+
     def test_retry_uses_new_req_id_but_keeps_same_action_trace(self):
         cases = (
             (wps_excel.WpsExcelController, "setCellValue"),

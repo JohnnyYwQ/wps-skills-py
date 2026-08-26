@@ -16,11 +16,21 @@ import tempfile
 import threading
 import time
 from datetime import datetime, timezone
+from typing import Optional, Tuple
 import uuid
 
 
 RETENTION_SECONDS = 24 * 60 * 60
 CLEANUP_INTERVAL_SECONDS = 60 * 60
+
+# ==================== 手动 trace 开关 ====================
+# "info"：只记录低敏元数据、耗时和错误（默认）
+# "debug"：额外记录脱敏后的调用参数和响应摘要
+#
+# LLM 调用 scripts/call.py 时无需改变命令；手动修改这一行即可切换。
+# 若进程环境显式设置了 WPS_TRACE，则环境变量优先，便于临时覆盖。
+TRACE_LEVEL = "debug"
+
 _TRACE_ID_RE = re.compile(r"^act-(\d{8})-([a-f0-9]{32})$")
 _WRITE_LOCK = threading.Lock()
 
@@ -53,6 +63,13 @@ _CONTENT_KEYS = {
     "values",
     "xml",
 }
+
+
+def _configured_trace_level() -> str:
+    """解析 trace 级别；无效值安全降级为 info，不能阻断 Action。"""
+    environment_level = os.environ.get("WPS_TRACE", "").strip().lower()
+    configured_level = environment_level or str(TRACE_LEVEL).strip().lower()
+    return "debug" if configured_level == "debug" else "info"
 
 
 def _utc_timestamp() -> str:
@@ -105,7 +122,7 @@ def _check_writable(root: Path) -> None:
             pass
 
 
-def _select_log_root() -> tuple[Path | None, str | None]:
+def _select_log_root() -> Tuple[Optional[Path], Optional[str]]:
     override = os.environ.get("WPS_TRACE_DIR")
     candidates = []
     if override:
@@ -173,7 +190,7 @@ def _remove_old_logs_unchecked(root: Path) -> None:
             pass
 
 
-def _remove_old_logs(root: Path) -> str | None:
+def _remove_old_logs(root: Path) -> Optional[str]:
     """惰性清理过期日志；清理失败不得影响 Action 执行。"""
     try:
         _remove_old_logs_unchecked(root)
@@ -182,7 +199,7 @@ def _remove_old_logs(root: Path) -> str | None:
         return f"过期日志清理失败: {type(exc).__name__}: {exc}"
 
 
-def server_log_path() -> tuple[Path | None, str | None]:
+def server_log_path() -> Tuple[Optional[Path], Optional[str]]:
     """返回后台桥接服务的普通 stdout/stderr 日志路径。"""
     root, warning = _select_log_root()
     if root is None:
@@ -209,7 +226,7 @@ def _content_summary(value: str) -> dict:
     }
 
 
-def _debug_summary(value, key: str | None = None, depth: int = 0):
+def _debug_summary(value, key: Optional[str] = None, depth: int = 0):
     key_lower = (key or "").lower()
     if any(part in key_lower for part in _SECRET_KEY_PARTS):
         return "<redacted>"
@@ -270,7 +287,8 @@ class ActionTrace:
     def __init__(self, trace_id: str, component: str):
         self.trace_id = trace_id
         self.component = component
-        self.debug_enabled = os.environ.get("WPS_TRACE", "info").strip().lower() == "debug"
+        self.trace_level = _configured_trace_level()
+        self.debug_enabled = self.trace_level == "debug"
         self._warnings = []
         root, warning = _select_log_root()
         if warning:
@@ -292,7 +310,7 @@ class ActionTrace:
         return cls(_new_trace_id(), component)
 
     @classmethod
-    def resume(cls, trace_id: str | None, component: str) -> "ActionTrace":
+    def resume(cls, trace_id: Optional[str], component: str) -> "ActionTrace":
         if _valid_trace_id(trace_id):
             return cls(str(trace_id), component)
         trace = cls(_new_trace_id(), component)
@@ -301,7 +319,7 @@ class ActionTrace:
         return trace
 
     @property
-    def warning(self) -> str | None:
+    def warning(self) -> Optional[str]:
         if not self._warnings:
             return None
         return "；".join(dict.fromkeys(self._warnings))
