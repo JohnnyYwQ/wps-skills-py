@@ -3,31 +3,12 @@
 # ============================================
 
 # ============================================
-# 私有文档 (不同步到GitHub)
+# 私有资料 (不同步到GitHub)
 # ============================================
-docs/
 WPS接口API/
-/scripts/
 /logs/
 planplan.md
-**/tests/
-**/test/
-**/README.md
-!README.md
 
-# ============================================
-# Node.js 依赖
-# ============================================
-node_modules/
-**/node_modules/
-
-# npm 缓存和日志
-.npm/
-npm-debug.log*
-yarn-debug.log*
-yarn-error.log*
-pnpm-debug.log*
-.pnpm-store/
 
 # 包管理器锁文件 (可选保留)
 # package-lock.json
@@ -44,11 +25,6 @@ build/
 out/
 .next/
 .nuxt/
-
-# TypeScript 编译产物
-*.js.map
-*.d.ts
-!src/**/*.d.ts
 
 # ============================================
 # IDE 和编辑器
@@ -197,7 +173,6 @@ api-docs/
 __pycache__/
 *.py[cod]
 *$py.class
-.Python
 venv/
 .venv/
 
@@ -207,12 +182,7 @@ CHANGELOG.md
 .claude
 .spec-workflow
 
-# 其他过程文件
+# 仅供本地分析的过程文档
+docs/
 CONTEXT.md
 understand.md
-
-# 废弃文件
-wps-claude-addon/
-wps-claude-assistant/
-
-
