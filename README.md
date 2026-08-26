@@ -2,151 +2,131 @@
 
 > 此项目的任何功能、架构更新，必须在结束后同步更新相关文档。这是我们契约的一部分。
 
-AI编程助手通过自然语言操控WPS Office的MCP工具集。
+WPS Skills 让智能体通过本地 Python 桥接操控 WPS Excel、PPT 和 Word。当前运行时不依赖 MCP、Node.js、外网或 pip 安装。
 
-## 项目定位
+## 运行架构
 
-本项目是MCP Server + Skills框架，让AI助手（Claude Code/Cursor/Augment等）能操控WPS Office。
-- 231个MCP专业工具 + 12个内置工具 = 243个
-- 支持Excel(82工具) / Word(28工具) / PPT(112工具) / 通用(9工具)
-- 支持macOS、Windows、Linux
-
-## 前提条件
-
-- 已安装 WPS Office（https://www.wps.cn/ 或 https://www.wps.com/）
-- Node.js >= 18.0.0
-- Git
-
-## 自动安装（AI执行）
-
-以下步骤由AI助手自动执行。需要人类交互的步骤标注 ⚠️。
-
-### 步骤1: 克隆项目
-
-```bash
-git clone https://github.com/lc2panda/wps-skills.git
-cd wps-skills
+```text
+智能体 / 用户
+  → python scripts/call.py <action> ...
+  → HTTP 127.0.0.1:58891/dispatch
+  → bridge/server.py 路由到 Excel / PPT / Word 控制器
+  → Windows: 持久 PowerShell line-RPC → WPS COM
+    Linux: 进程内 openpyxl / OpenXML 文件后端
 ```
 
-如果项目已存在，跳过此步。
+一次 `call.py` 只执行一个 Action。多 Action 的任务由智能体逐步编排；执行桥不创建 `task-id`。
 
-### 步骤2: 安装依赖并编译
+## 平台
+
+| 平台 | 支持情况 | 后端 |
+|---|---|---|
+| Windows | 支持 | PowerShell 5.1 + WPS COM：`Ket.Application` / `Kwpp.Application` / `Kwps.Application` |
+| Linux | 支持文件级自动化 | vendored openpyxl（Excel）及标准库 OpenXML（PPT/Word） |
+| macOS | 不支持真实 WPS 自动化 | 没有对应控制器 |
+
+Python 需要 3.8 或更高版本。Windows 需要已安装且正确注册 COM 的 WPS Office；无需提前手动打开应用，首个目标 Action 会复用现有实例或尝试创建它。
+
+## 快速使用
+
+先检查环境：
 
 ```bash
-cd wps-office-mcp
-npm install
-npm run build
-cd ..
+python scripts/install.py --check
 ```
 
-### 步骤3: 配置MCP Server
+直接调用 Action；`call.py` 会自动启动本地桥接服务：
 
-根据使用的AI工具，将以下配置写入对应文件。注意将路径替换为实际的项目绝对路径。
+```bash
+# Excel
+python scripts/call.py setCellValue '{"cell":"A1","value":42}'
 
-**Claude Code** — 写入 `~/.claude/settings.json`：
+# PPT
+python scripts/call.py createPresentation '{}'
+python scripts/call.py addSlide '{"layout":"blank"}'
+
+# Word
+python scripts/call.py createDocument '{}'
+python scripts/call.py insertText '{"text":"hello"}'
+```
+
+PowerShell 5.1 下推荐参数文件，避免 shell 改写 JSON 引号：
+
+```powershell
+python scripts/call.py addSlide --params-file C:\tmp\slide.json
+```
+
+唯一归属的 Action 自动路由。重名 Action 必须显式指定应用：
+
+```bash
+python scripts/call.py findReplace --app word --params-file replace.json
+python scripts/call.py insertImage --app ppt --params-file image.json
+```
+
+缺少 `--app` 会返回 `AMBIGUOUS_ACTION` 和候选应用，不会猜测并操作错误的软件。直接 HTTP 调用时使用与 `action` 同级的 `app`。
+
+完整 Action 契约和操作清单见 [SKILL.md](SKILL.md)，整条执行链说明见 [understand.md](understand.md)。
+
+## Action trace
+
+每个 Action 默认创建一个结构化 JSONL trace。成功和失败响应都返回：
+
 ```json
 {
-  "mcpServers": {
-    "wps-office": {
-      "command": "node",
-      "args": ["/你的路径/wps-skills/wps-office-mcp/dist/index.js"]
-    }
-  }
+  "success": false,
+  "error": "…",
+  "traceId": "act-20260826-…",
+  "traceLog": "C:\\...\\wps-skills\\logs\\traces\\2026-08-26\\act-20260826-….jsonl"
 }
 ```
 
-**Cursor** — 写入项目根目录 `.cursor/mcp.json`：
-```json
-{
-  "mcpServers": {
-    "wps-office": {
-      "command": "node",
-      "args": ["/你的路径/wps-skills/wps-office-mcp/dist/index.js"]
-    }
-  }
-}
+默认日志位置：
+
+```text
+logs/traces/YYYY-MM-DD/<traceId>.jsonl
+logs/server-YYYY-MM-DD.log
 ```
 
-**OpenAI Codex CLI** — 写入 `~/.codex/config.toml`：
-```toml
-[mcp_servers.wps-office]
-command = "node"
-args = ["/你的路径/wps-skills/wps-office-mcp/dist/index.js"]
-```
-或命令行注册：`codex mcp add wps-office -- node /你的路径/wps-skills/wps-office-mcp/dist/index.js`
+- `traceId` 贯穿 `call.py → HTTP → 路由 → 控制器 → PowerShell/COM`。
+- 默认 `WPS_TRACE=info` 只记录低敏元数据、耗时和错误。
+- 实机复现前可设置 `WPS_TRACE=debug`，增加脱敏后的参数和响应摘要。
+- `WPS_TRACE_DIR` 可覆盖日志根目录；skill 目录不可写时，Windows 降级到 `%LOCALAPPDATA%\wps-skills\logs`。
+- 所有候选目录都不可写时，Action 仍执行，响应以 `traceLog:null`/`traceWarning` 明确降级。
+- trace 和 server 日志只保留 24 小时，自动清理不会触碰其他项目文件。
 
-**Augment / 其他MCP兼容IDE** — 参考各IDE的MCP Server配置文档，使用相同的command和args。本项目 MCP Server 为标准 stdio 实现（spec 2025-11-25），与所有 MCP 一等客户端（Claude Code / Cursor / Codex CLI / GitHub Copilot CLI / Windsurf 等）兼容。
+## 路由和可靠性
 
-### 步骤4: 安装WPS加载项
+- HTTP 服务单线程执行，避免 PowerShell 单行协议交错。
+- 每次 PowerShell 尝试使用独立 `reqId`；同一 Action 的自动重试保持相同 `traceId`。
+- stderr 会被持续排空并写入对应 Action trace，避免管道阻塞。
+- 单 Action 超过 60 秒会终止桥接进程；可恢复 COM 故障会自动重连并重试一次。
+- `saveAs` 等通用 Action 建议显式指定应用；缺失时可以按目标文件扩展名推断。
 
-⚠️ 需要人工操作（AI无法直接操作WPS应用）：
+## 验证
+
+不需要 Windows 或 WPS 的单元测试：
 
 ```bash
-# macOS
-bash scripts/auto-install-mac.sh
-
-# Windows (PowerShell)
-powershell scripts/install.ps1
-
-# Linux
-bash scripts/install.sh
+PYTHONPATH=bridge python -m unittest \
+  bridge/test_action_trace.py \
+  bridge/test_server_routing.py \
+  bridge/test_controller_trace.py
 ```
 
-⚠️ 安装后必须重启WPS Office才能生效。
-
-### 步骤5: 安装Skills（仅Claude Code需要）
+实机连通和功能检查：
 
 ```bash
-# 创建skills目录（如不存在）
-mkdir -p ~/.claude/skills
-
-# 创建符号链接
-ln -sf "$(pwd)/skills/wps-excel" ~/.claude/skills/wps-excel
-ln -sf "$(pwd)/skills/wps-word" ~/.claude/skills/wps-word
-ln -sf "$(pwd)/skills/wps-ppt" ~/.claude/skills/wps-ppt
-ln -sf "$(pwd)/skills/wps-office" ~/.claude/skills/wps-office
+python scripts/test.py
+python scripts/test_functional.py
 ```
 
-### 步骤6: 验证安装
+## 重要文档
 
-```bash
-# 验证MCP Server可启动
-node wps-office-mcp/dist/index.js &
-# 应看到 "MCP Server started successfully" 日志
-kill %1 2>/dev/null
-```
-
-## 架构
-
-```
-Skills层(SKILL.md自然语言指导)
-  ↓ Claude Code调用
-MCP Server层(239个工具)
-  ↓ wpsClient.executeMethod()
-执行层
-  ├── macOS: wps-claude-assistant (227 action, HTTP轮询)
-  └── Windows: wps-com.ps1 (231 action, COM接口)
-```
-
-## 工具清单
-
-| 应用 | 工具数 | 主要能力 |
-|------|--------|---------|
-| Excel | 82 | 公式/数据/图表/透视表/工作表/格式/工作簿/行列/批注保护/图片导出 |
-| Word | 28 | 格式/内容/文档管理/页眉页脚/批注/模板填写/段落结构 |
-| PPT | 112 | 幻灯片/形状/图片/表格/美化/动画/图表/3D/数据可视化/图片导出 |
-| 通用 | 9 | 保存/连接检测/文本选取/格式转换 |
-| 内置 | 12 | 连接检查/万能方法调用/数据缓存 |
-
-## 故障排除
-
-| 问题 | 解决方案 |
-|------|---------|
-| MCP连接失败 | 确认 `npm install && npm run build` 已执行，检查dist/index.js存在 |
-| WPS未响应 | 重启WPS Office，确认加载项已安装 |
-| "arguments error" | 重新运行安装脚本，重启WPS |
-| Linux找不到插件 | 查看INSTALL.md中的Linux专用指南 |
-| 工具调用返回null | 确认WPS中已打开对应类型的文档 |
+- [SKILL.md](SKILL.md)：智能体调用约定与 Action 清单
+- [understand.md](understand.md)：端到端执行链、任务边界和排障说明
+- [CONTEXT.md](CONTEXT.md)：项目统一术语
+- [docs/adr/0001-explicit-app-for-ambiguous-actions.md](docs/adr/0001-explicit-app-for-ambiguous-actions.md)：重名 Action 路由决策
+- [docs/adr/0002-action-level-tracing-boundary.md](docs/adr/0002-action-level-tracing-boundary.md)：Action trace 边界决策
 
 ## 许可证
 
