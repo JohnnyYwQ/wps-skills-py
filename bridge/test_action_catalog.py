@@ -90,6 +90,20 @@ class ActionCatalogTests(unittest.TestCase):
             json.loads(output.getvalue()),
         )
 
+    def test_default_catalog_exposes_semantic_descriptions_and_write_risks(self):
+        catalog = ActionCatalog.from_path()
+
+        self.assertEqual("write", catalog.get("excel", "findReplace")["risk"])
+        self.assertEqual("write", catalog.get("word", "findReplace")["risk"])
+        self.assertEqual(
+            ["ppt"],
+            [item["owner"] for item in catalog.search("新增幻灯片")],
+        )
+        self.assertEqual(
+            ["excel", "word"],
+            sorted(item["owner"] for item in catalog.search("替换文本")),
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

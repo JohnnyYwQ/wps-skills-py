@@ -4,6 +4,8 @@ import json
 import re
 from pathlib import Path
 
+from powershell_contracts import CHART_TYPE_ACTIONS
+
 
 MANIFEST_PATH = Path(__file__).with_name("action_manifest.json")
 SUPPORTED_SCHEMA_KEYWORDS = {
@@ -87,7 +89,10 @@ def _validate_schema_keywords(schema, path):
             _manifest_error(f"{path}.{keyword}", "is not supported")
 
     schema_type = schema.get("type")
-    if schema_type is not None and schema_type not in SUPPORTED_SCHEMA_TYPES:
+    if schema_type is not None and (
+        not isinstance(schema_type, str)
+        or schema_type not in SUPPORTED_SCHEMA_TYPES
+    ):
         _manifest_error(f"{path}.type", f"must be one of {sorted(SUPPORTED_SCHEMA_TYPES)}")
     if schema_type is None and "anyOf" not in schema:
         _manifest_error(path, "must declare type or anyOf")
@@ -170,13 +175,13 @@ def _validate_contract(contract, index):
     unknown = set(contract) - CONTRACT_FIELDS
     if unknown:
         _manifest_error(path, f"contains unknown fields {sorted(unknown)}")
-    if contract["owner"] not in SUPPORTED_OWNERS:
+    if not isinstance(contract["owner"], str) or contract["owner"] not in SUPPORTED_OWNERS:
         _manifest_error(f"{path}.owner", f"must be one of {sorted(SUPPORTED_OWNERS)}")
     if not isinstance(contract["action"], str) or not re.fullmatch(r"[A-Za-z][A-Za-z0-9]*", contract["action"]):
         _manifest_error(f"{path}.action", "must be a wire Action name")
     if not isinstance(contract["description"], str) or not contract["description"].strip():
         _manifest_error(f"{path}.description", "must be a non-empty string")
-    if contract["risk"] not in SUPPORTED_RISKS:
+    if not isinstance(contract["risk"], str) or contract["risk"] not in SUPPORTED_RISKS:
         _manifest_error(f"{path}.risk", f"must be one of {sorted(SUPPORTED_RISKS)}")
     prerequisites = contract["prerequisites"]
     if not isinstance(prerequisites, list) or any(
@@ -213,7 +218,7 @@ def load_action_manifest(path=MANIFEST_PATH):
     unknown = set(manifest) - TOP_LEVEL_FIELDS
     if unknown:
         _manifest_error("manifest", f"contains unknown fields {sorted(unknown)}")
-    if manifest.get("schema_version") != 1:
+    if type(manifest.get("schema_version")) is not int or manifest["schema_version"] != 1:
         _manifest_error("schema_version", "must be 1")
     actions = manifest.get("actions")
     if not isinstance(actions, list):
@@ -232,7 +237,7 @@ def load_action_manifest(path=MANIFEST_PATH):
         route_path = f"routing_defaults.{action}"
         if not isinstance(action, str) or not action:
             _manifest_error("routing_defaults", "keys must be non-empty strings")
-        if owner not in APP_OWNERS:
+        if not isinstance(owner, str) or owner not in APP_OWNERS:
             _manifest_error(route_path, f"must be one of {sorted(APP_OWNERS)}")
         if (owner, action) not in identities:
             _manifest_error(route_path, "must reference an existing contract")
@@ -384,3 +389,30 @@ def validate_windows_implementation_consistency(catalog, scripts_by_owner):
                 f"differs from manifest: missing contracts={missing_contracts}, "
                 f"missing handlers={missing_handlers}",
             )
+
+        if owner in CHART_TYPE_ACTIONS:
+            contract = catalog.get(owner, CHART_TYPE_ACTIONS[owner])
+            chart_schema = contract["parameters"]["properties"]["chartType"]
+            string_schema = next(
+                option for option in chart_schema["anyOf"]
+                if option.get("type") == "string"
+            )
+            expected_types = set(string_schema["enum"])
+            function_match = re.search(
+                r"(?ms)^function Convert-ChartType\(\$value\) \{.*?^\}",
+                script,
+            )
+            implemented_types = set()
+            if function_match:
+                implemented_types = set(re.findall(
+                    r'^\s*"([A-Za-z]+)"\s*\{\s*return\b',
+                    function_match.group(0),
+                    re.MULTILINE,
+                ))
+            if implemented_types != expected_types:
+                _manifest_error(
+                    f"implementation.{owner}.chartType",
+                    "differs from manifest: "
+                    f"manifest={sorted(expected_types)}, "
+                    f"implementation={sorted(implemented_types)}",
+                )

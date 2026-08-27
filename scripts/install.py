@@ -108,6 +108,7 @@ def check_files():
         ("bridge/action_trace.py", "Action 结构化追踪与 24 小时保留"),
         ("bridge/action_catalog.py", "Action Contract Catalog 与校验器"),
         ("bridge/action_manifest.json", "Windows Action Contract 唯一事实源"),
+        ("bridge/powershell_contracts.py", "共享 PowerShell 契约枚举转换"),
         ("bridge/service_lifecycle.py", "bridge 实例身份与生命周期"),
         ("bridge/windows_com.py", "Windows COM 注册视图与 PowerShell 解析"),
         ("bridge/server.py", "统一桥接服务"),

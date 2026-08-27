@@ -118,7 +118,9 @@ class ActionRoutingTests(unittest.TestCase):
         self.assertEqual(["excel"], result["supportedApps"])
 
     def test_invalid_params_are_rejected_before_controller_initialization(self):
-        with patch.object(server, "get_app_controller") as get_controller:
+        with patch.object(server.sys, "platform", "win32"), patch.object(
+            server, "get_app_controller"
+        ) as get_controller:
             result = server.dispatch(
                 "deleteSlide", {"slideIndex": "1"}, app="ppt"
             )
@@ -129,7 +131,9 @@ class ActionRoutingTests(unittest.TestCase):
         get_controller.assert_not_called()
 
     def test_unknown_parameter_is_rejected(self):
-        with patch.object(server, "get_app_controller") as get_controller:
+        with patch.object(server.sys, "platform", "win32"), patch.object(
+            server, "get_app_controller"
+        ) as get_controller:
             result = server.dispatch(
                 "addSlide", {"layout": "blank", "template": "extra"}, app="ppt"
             )
@@ -145,12 +149,33 @@ class ActionRoutingTests(unittest.TestCase):
             "success": True,
             "data": {"slideIndex": "one", "slideCount": 1},
         }
-        with patch.object(server, "get_app_controller", return_value=controller):
+        with patch.object(server.sys, "platform", "win32"), patch.object(
+            server, "get_app_controller", return_value=controller
+        ):
             result = server.dispatch("addSlide", {}, app="ppt")
 
         self.assertFalse(result["success"])
         self.assertEqual("INVALID_RESULT", result["code"])
         self.assertIn("result.slideIndex must be number", result["error"])
+
+    def test_linux_backend_bypasses_windows_v1_contract_validation(self):
+        controller = MagicMock()
+        controller.platform = "Linux"
+        controller.execute.return_value = {
+            "success": True,
+            "data": {"cell": "A1", "value": 42},
+        }
+        with patch.object(server.sys, "platform", "linux"), patch.object(
+            server, "get_app_controller", return_value=controller
+        ):
+            result = server.dispatch(
+                "setCellValue", {"cell": "A1", "value": 42}, app="excel"
+            )
+
+        self.assertTrue(result["success"])
+        controller.execute.assert_called_once_with(
+            "setCellValue", {"cell": "A1", "value": 42}, trace=None
+        )
 
     def test_server_actions_are_listed_once_as_bridge_contracts(self):
         actions = server.get_action_list()

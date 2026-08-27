@@ -10,10 +10,9 @@ WPS Skills 让智能体通过本地 Python 桥接操控 WPS Excel、PPT 和 Word
 智能体 / 用户
   → python scripts/call.py <action> ...
   → HTTP 127.0.0.1:58891/dispatch
-  → action_manifest.json 路由并校验参数
-  → bridge/server.py 调用 Excel / PPT / Word 控制器并校验结果
-  → Windows: 持久 PowerShell line-RPC → WPS COM
-    Linux: 进程内 openpyxl / OpenXML 文件后端
+  → action_manifest.json 路由到 Excel / PPT / Word 控制器
+  → Windows: 严格校验参数 → PowerShell line-RPC → WPS COM → 严格校验结果
+    Linux: 保留现有参数语义 → 进程内 openpyxl / OpenXML 文件后端
 ```
 
 一次 `call.py` 只执行一个 Action。多 Action 的任务由智能体逐步编排；执行桥不创建 `task-id`。同一任务中的 Action 会复用 bridge，任务保存并验证完成后应显式停止它。
@@ -106,7 +105,7 @@ python scripts/service.py restart
 
 首次升级若 `python scripts/service.py status` 返回 `legacy`，命令输出会给出 Windows/macOS/Linux 的监听 PID 定位方式。先核对进程路径并保存它持有的文档，再人工终止旧进程；新版 bridge 此后即可由 `service.py stop/restart` 正常管理。
 
-完整 Action 契约和操作清单见 [SKILL.md](SKILL.md)，整条执行链说明见 [understand.md](understand.md)。
+精确 Action Contract 通过 `scripts/actions.py` 或 `bridge/action_manifest.json` 查询；[SKILL.md](SKILL.md) 只维护调用工作流和风险边界，整条执行链说明见 [understand.md](understand.md)。
 
 ## Action trace
 

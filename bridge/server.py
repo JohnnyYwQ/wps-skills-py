@@ -201,6 +201,7 @@ def route_action(action, params=None, requested_app=None):
 def _prepare_dispatch(action, params, app=None, trace=None):
     """无副作用地校验并路由 Action；不接触 controller。"""
     dispatch_started = time.perf_counter()
+    validate_windows_contract = sys.platform == "win32"
     if trace:
         trace.event("dispatch.started", action=action, requestedApp=app)
     if not action:
@@ -227,19 +228,21 @@ def _prepare_dispatch(action, params, app=None, trace=None):
     if owners == ["bridge"]:
         action_params = dict(params)
         action_params.pop("app", None)
-        try:
-            ACTION_CATALOG.validate_params("bridge", action, action_params)
-        except ActionValidationError as exc:
-            result = _route_error("INVALID_PARAMS", str(exc))
-            if trace:
-                trace.event("dispatch.rejected", status="error", code=result["code"], error=result["error"])
-            return None, result
+        if validate_windows_contract:
+            try:
+                ACTION_CATALOG.validate_params("bridge", action, action_params)
+            except ActionValidationError as exc:
+                result = _route_error("INVALID_PARAMS", str(exc))
+                if trace:
+                    trace.event("dispatch.rejected", status="error", code=result["code"], error=result["error"])
+                return None, result
         return {
             "action": action,
             "params": action_params,
             "requestedApp": app,
             "route": {"app": "bridge", "source": "action_registry", "supportedApps": ["bridge"]},
             "started": dispatch_started,
+            "validateWindowsContract": validate_windows_contract,
         }, None
 
     route, route_error = route_action(action, params, requested_app=app)
@@ -265,26 +268,28 @@ def _prepare_dispatch(action, params, app=None, trace=None):
         )
     action_params = dict(params)
     action_params.pop("app", None)
-    try:
-        ACTION_CATALOG.validate_params(route["app"], action, action_params)
-    except ActionValidationError as exc:
-        result = _route_error("INVALID_PARAMS", str(exc))
-        if trace:
-            trace.event(
-                "dispatch.rejected",
-                status="error",
-                action=action,
-                app=route["app"],
-                code=result["code"],
-                error=result["error"],
-            )
-        return None, result
+    if validate_windows_contract:
+        try:
+            ACTION_CATALOG.validate_params(route["app"], action, action_params)
+        except ActionValidationError as exc:
+            result = _route_error("INVALID_PARAMS", str(exc))
+            if trace:
+                trace.event(
+                    "dispatch.rejected",
+                    status="error",
+                    action=action,
+                    app=route["app"],
+                    code=result["code"],
+                    error=result["error"],
+                )
+            return None, result
     return {
         "action": action,
         "params": action_params,
         "requestedApp": app,
         "route": route,
         "started": dispatch_started,
+        "validateWindowsContract": validate_windows_contract,
     }, None
 
 
@@ -301,10 +306,11 @@ def dispatch(action, params, app=None, trace=None, prepared=None):
     selected_app = route["app"]
     if selected_app == "bridge":
         result = handle_ping(trace=trace)
-        try:
-            ACTION_CATALOG.validate_result("bridge", action, result.get("data", {}))
-        except ActionValidationError as exc:
-            return _route_error("INVALID_RESULT", str(exc))
+        if prepared["validateWindowsContract"]:
+            try:
+                ACTION_CATALOG.validate_result("bridge", action, result.get("data", {}))
+            except ActionValidationError as exc:
+                return _route_error("INVALID_RESULT", str(exc))
         return result
     controller_started = time.perf_counter()
     try:
@@ -352,7 +358,11 @@ def dispatch(action, params, app=None, trace=None, prepared=None):
     except Exception as exc:
         result = {"success": False, "error": f"执行失败: {exc}"}
 
-    if result.get("success"):
+    if (
+        result.get("success")
+        and prepared["validateWindowsContract"]
+        and platform_name == "Windows"
+    ):
         try:
             ACTION_CATALOG.validate_result(
                 selected_app,

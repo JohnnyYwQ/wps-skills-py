@@ -628,7 +628,7 @@
     {
       "owner": "excel",
       "action": "createChart",
-      "description": "在 Windows WPS 表格 中执行 createChart Action。",
+      "description": "根据工作表数据区域创建图表，并设置图表类型、位置和显示选项。",
       "parameters": {
         "type": "object",
         "properties": {
@@ -1359,7 +1359,7 @@
     {
       "owner": "excel",
       "action": "findReplace",
-      "description": "在 Windows WPS 表格 中执行 findReplace Action。",
+      "description": "在当前工作簿中查找并替换文本。",
       "parameters": {
         "type": "object",
         "properties": {
@@ -1394,7 +1394,7 @@
       "prerequisites": [
         "active_workbook"
       ],
-      "risk": "read"
+      "risk": "write"
     },
     {
       "owner": "excel",
@@ -4221,7 +4221,7 @@
     {
       "owner": "ppt",
       "action": "addSlide",
-      "description": "在 Windows WPS 演示 中执行 addSlide Action。",
+      "description": "在当前演示文稿中新增幻灯片。",
       "parameters": {
         "type": "object",
         "properties": {
@@ -6115,7 +6115,7 @@
     {
       "owner": "ppt",
       "action": "insertPptChart",
-      "description": "在 Windows WPS 演示 中执行 insertPptChart Action。",
+      "description": "在指定幻灯片中插入图表，并设置数据、类型和位置。",
       "parameters": {
         "type": "object",
         "properties": {
@@ -8335,7 +8335,7 @@
     {
       "owner": "word",
       "action": "findReplace",
-      "description": "在 Windows WPS 文字 中执行 findReplace Action。",
+      "description": "在当前文档中查找并替换文本。",
       "parameters": {
         "type": "object",
         "properties": {
@@ -8376,7 +8376,7 @@
       "prerequisites": [
         "active_document"
       ],
-      "risk": "read"
+      "risk": "write"
     },
     {
       "owner": "word",
@@ -9375,5 +9375,3 @@
     }
   ]
 }
-
-

@@ -24,6 +24,7 @@ import queue
 import threading
 from typing import Any, Dict, Optional
 
+from powershell_contracts import render_chart_type_converter
 from service_lifecycle import stop_line_process
 from windows_com import describe_powershell_startup_failure, resolve_com_runtime
 
@@ -103,22 +104,7 @@ function Convert-HexToOle($hex) {
     } catch { return $null }
 }
 
-function Convert-ChartType($value) {
-    if ($value -is [string]) {
-        switch ($value.ToLowerInvariant()) {
-            "column" { return 51 }
-            "bar" { return 57 }
-            "line" { return 4 }
-            "pie" { return 5 }
-            "doughnut" { return -4120 }
-            "area" { return 1 }
-            "scatter" { return -4169 }
-            default { throw "未知 chartType: $value" }
-        }
-    }
-    return [int]$value
-}
-
+''' + render_chart_type_converter() + r'''
 function Convert-Distribution($value) {
     if ($value -is [string]) {
         switch ($value.ToLowerInvariant()) {

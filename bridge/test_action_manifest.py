@@ -75,6 +75,7 @@ class ActionManifestValidationTests(unittest.TestCase):
             "risk": "write",
         }
         invalid_manifests = (
+            ({"schema_version": True, "actions": []}, "schema_version"),
             ({"schema_version": 2, "actions": []}, "schema_version"),
             (
                 {"schema_version": 1, "actions": [contract, dict(contract)]},
@@ -86,6 +87,35 @@ class ActionManifestValidationTests(unittest.TestCase):
                     "actions": [dict(contract, owner="spreadsheet")],
                 },
                 "actions[0].owner",
+            ),
+            (
+                {
+                    "schema_version": 1,
+                    "actions": [dict(contract, owner=["ppt"])],
+                },
+                "actions[0].owner",
+            ),
+            (
+                {
+                    "schema_version": 1,
+                    "actions": [dict(contract, risk=["write"])],
+                },
+                "actions[0].risk",
+            ),
+            (
+                {
+                    "schema_version": 1,
+                    "actions": [{
+                        **contract,
+                        "parameters": {
+                            "type": ["object"],
+                            "properties": {},
+                            "required": [],
+                            "additionalProperties": False,
+                        },
+                    }],
+                },
+                "parameters.type",
             ),
             (
                 {
@@ -200,6 +230,26 @@ class ActionManifestValidationTests(unittest.TestCase):
         self.assertEqual({"ping", "wireCheck"}, {
             item["action"] for item in catalog.list(owner="bridge")
         })
+
+    def test_shared_chart_type_contract_cannot_drift_between_controllers(self):
+        catalog = ActionCatalog.from_path()
+        drifted_ppt = wps_ppt.PS_BRIDGE_SCRIPT.replace(
+            '"scatter" { return -4169 }',
+            '"bubble" { return 15 }',
+            1,
+        )
+
+        with self.assertRaises(ActionManifestError) as raised:
+            validate_windows_implementation_consistency(
+                catalog,
+                {
+                    "excel": wps_excel.PS_BRIDGE_SCRIPT,
+                    "ppt": drifted_ppt,
+                    "word": wps_word.PS_BRIDGE_SCRIPT,
+                },
+            )
+
+        self.assertIn("implementation.ppt.chartType", str(raised.exception))
 
 
 if __name__ == "__main__":
