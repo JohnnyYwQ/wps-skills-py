@@ -467,12 +467,10 @@ class Handler(BaseHTTPRequestHandler):
             "status": "stopping",
             "instanceId": lifecycle.identity["instanceId"],
         }
-        try:
-            self._send(result, 202)
-        finally:
-            # 主循环会在当前响应返回后观察到该标记并停止接受新连接；
-            # server_close() 随后等待已启动的 handler 完成。
-            lifecycle.request_stop("api")
+        # 先切换为 stopping，再写 202，避免并发 dispatch 在响应写入窗口被接纳。
+        # 主循环随后停止接受新连接；server_close() 等待已启动的 handler 完成。
+        lifecycle.request_stop("api")
+        self._send(result, 202)
 
     def _handle_dispatch(self):
         request_started = time.perf_counter()

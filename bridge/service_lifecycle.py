@@ -329,14 +329,14 @@ class BridgeLifecycle:
         self._action_lock.acquire()
         admitted = False
         try:
-            if not self.should_stop():
-                with self._lock:
+            with self._lock:
+                if not self._should_stop_locked():
                     self._active_action = {
                         "traceId": trace_id,
                         "action": action,
                         "startedAt": utc_timestamp(),
                     }
-                admitted = True
+                    admitted = True
             yield admitted
         finally:
             if admitted:
@@ -349,20 +349,27 @@ class BridgeLifecycle:
         with self._lock:
             return max(0.0, self._clock() - self._last_action_monotonic)
 
-    def should_stop(self) -> bool:
+    def _should_stop_locked(self) -> bool:
         signal_reason = self._signal_stop_reason
         if signal_reason is not None:
-            self.request_stop(signal_reason)
+            if self._stop_reason is None:
+                self._stop_reason = signal_reason
+            self._stop_event.set()
         if self._stop_event.is_set():
             return True
-        with self._lock:
-            if self._active_action is not None:
-                return False
-            idle_for = max(0.0, self._clock() - self._last_action_monotonic)
-            if self.idle_timeout_seconds and idle_for >= self.idle_timeout_seconds:
-                self.request_stop("idle_timeout")
-                return True
+        if self._active_action is not None:
+            return False
+        idle_for = max(0.0, self._clock() - self._last_action_monotonic)
+        if self.idle_timeout_seconds and idle_for >= self.idle_timeout_seconds:
+            if self._stop_reason is None:
+                self._stop_reason = "idle_timeout"
+            self._stop_event.set()
+            return True
         return False
+
+    def should_stop(self) -> bool:
+        with self._lock:
+            return self._should_stop_locked()
 
     def health_snapshot(self) -> dict:
         server_pid = os.getpid()

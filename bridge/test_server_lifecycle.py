@@ -120,6 +120,39 @@ class ShutdownEndpointTests(unittest.TestCase):
         self.assertEqual(409, captured["code"])
         self.assertFalse(self.lifecycle.should_stop())
 
+    def test_shutdown_starts_before_acceptance_response_is_written(self):
+        shutdown, _ = _handler("/shutdown", self.lifecycle)
+        action, action_result = _handler(
+            "/dispatch",
+            self.lifecycle,
+            payload={"action": "ping", "params": {}},
+        )
+        response_started = threading.Event()
+        release_response = threading.Event()
+
+        def blocking_send(_result, _code=200):
+            response_started.set()
+            release_response.wait(timeout=1)
+
+        shutdown._send = blocking_send
+        shutdown_thread = threading.Thread(target=shutdown.do_POST)
+        try:
+            with patch.object(server, "dispatch") as fake_dispatch:
+                shutdown_thread.start()
+                self.assertTrue(response_started.wait(timeout=1))
+
+                action.do_POST()
+
+                self.assertEqual(503, action_result["code"])
+                self.assertEqual(
+                    "BRIDGE_SHUTTING_DOWN",
+                    action_result["result"]["code"],
+                )
+                fake_dispatch.assert_not_called()
+        finally:
+            release_response.set()
+            shutdown_thread.join(timeout=2)
+
 
 class ServerLoopTests(unittest.TestCase):
     def test_handler_concurrency_is_bounded(self):
