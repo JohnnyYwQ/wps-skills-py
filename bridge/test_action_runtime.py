@@ -246,6 +246,31 @@ class ActionRuntimeTests(unittest.TestCase):
         self.assertFalse(result["outcomeUnknown"])
         self.assertEqual(1, len(controller.calls))
 
+    def test_excel_no_active_workbook_is_a_clear_known_outcome(self):
+        controller = _ScriptedController([
+            {
+                "success": False,
+                "code": "NO_ACTIVE_DOCUMENT",
+                "error": "没有活动工作簿；请先创建或打开工作簿",
+            },
+        ])
+        runtime = ActionRuntime(
+            controller_factory=lambda app, trace=None, deadline=None: controller,
+        )
+        try:
+            result = runtime.execute(ActionRequest(
+                action="getCellValue",
+                app="excel",
+                params={"row": 1, "col": 1},
+            )).to_dict()
+        finally:
+            runtime.close()
+
+        self.assertFalse(result["success"])
+        self.assertEqual("NO_ACTIVE_DOCUMENT", result["code"])
+        self.assertFalse(result["outcomeUnknown"])
+        self.assertEqual(1, len(controller.calls))
+
     def test_read_action_returns_second_transient_failure_without_more_retries(self):
         failed = _ScriptedController([
             {"success": False, "error": "RPC server is unavailable (0x800706BA)"},

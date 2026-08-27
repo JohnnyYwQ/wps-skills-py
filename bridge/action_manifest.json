@@ -479,6 +479,9 @@
           "outputPath": {
             "type": "string"
           },
+          "overwrite": {
+            "type": "boolean"
+          },
           "targetFormat": {
             "type": "string"
           }
@@ -503,7 +506,7 @@
       "prerequisites": [
         "active_workbook"
       ],
-      "risk": "write"
+      "risk": "destructive"
     },
     {
       "owner": "excel",
@@ -514,6 +517,9 @@
         "properties": {
           "outputPath": {
             "type": "string"
+          },
+          "overwrite": {
+            "type": "boolean"
           }
         },
         "required": [],
@@ -534,7 +540,7 @@
       "prerequisites": [
         "active_workbook"
       ],
-      "risk": "write"
+      "risk": "destructive"
     },
     {
       "owner": "excel",
@@ -2716,6 +2722,9 @@
         "properties": {
           "filePath": {
             "type": "string"
+          },
+          "overwrite": {
+            "type": "boolean"
           }
         },
         "required": [
@@ -2742,7 +2751,7 @@
       "prerequisites": [
         "active_workbook"
       ],
-      "risk": "write"
+      "risk": "destructive"
     },
     {
       "owner": "excel",

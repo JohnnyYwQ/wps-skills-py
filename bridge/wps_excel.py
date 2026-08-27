@@ -35,7 +35,7 @@ IS_MACOS = platform.system() == "Darwin"
 EXCEL_PROGID = "Ket.Application"
 
 # 单个 action 执行超时（秒）：超过则强杀 PowerShell 桥接进程，避免 COM 弹框导致永久卡死
-EXEC_TIMEOUT = 60
+EXEC_TIMEOUT = 120
 
 # PowerShell 桥接脚本（持久进程模式）
 PS_BRIDGE_SCRIPT = r'''
@@ -43,6 +43,10 @@ $OutputEncoding = [System.Text.Encoding]::UTF8
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 $error.Clear()
 $global:WpsActivationError = $null
+$global:ExcelActionsWithoutActiveWorkbook = @(
+    "ping", "getOpenWorkbooks", "getAppInfo", "reconnect", "switchWorkbook",
+    "createWorkbook", "openWorkbook"
+)
 
 # 创建/获取 COM 对象
 function Get-ExcelApp {
@@ -932,34 +936,76 @@ function Exec-save($p) {
     if (-not $wb) { return @{success=$false; error="无活动工作簿"} }
     try { $wb.Save(); return @{success=$true} } catch { return @{success=$false; error=$_.Exception.Message} }
 }
+
+function Invoke-ExcelSafeTargetWrite($targetPath, $overwrite, [scriptblock]$write) {
+    if (-not (Test-Path -LiteralPath $targetPath)) {
+        try {
+            & $write
+            return @{success=$true}
+        } catch {
+            return @{success=$false; code="TARGET_WRITE_FAILED"; error=$_.Exception.Message}
+        }
+    }
+    if (-not $overwrite) {
+        return @{success=$false; code="TARGET_EXISTS"; error="目标文件已存在: $targetPath"}
+    }
+
+    try {
+        $fullPath = [System.IO.Path]::GetFullPath($targetPath)
+        $directory = [System.IO.Path]::GetDirectoryName($fullPath)
+        $backupPath = [System.IO.Path]::Combine(
+            $directory,
+            "." + [System.IO.Path]::GetFileName($fullPath) + "." + [Guid]::NewGuid() + ".wps-backup"
+        )
+        [System.IO.File]::Copy($fullPath, $backupPath, $false)
+    } catch {
+        return @{success=$false; code="OVERWRITE_NOT_SAFE"; error="无法安全备份现有目标: $($_.Exception.Message)"}
+    }
+
+    $keepBackup = $true
+    try {
+        & $write
+        $keepBackup = $false
+        return @{success=$true}
+    } catch {
+        $writeError = $_.Exception.Message
+        try {
+            [System.IO.File]::Copy($backupPath, $fullPath, $true)
+            $keepBackup = $false
+            return @{success=$false; code="TARGET_WRITE_FAILED"; error="目标写入失败，已恢复原文件: $writeError"}
+        } catch {
+            return @{success=$false; code="OVERWRITE_RESTORE_FAILED"; error="目标写入失败且无法恢复；备份保留在 $backupPath: $writeError"}
+        }
+    } finally {
+        if (-not $keepBackup) {
+            try { [System.IO.File]::Delete($backupPath) } catch {}
+        }
+    }
+}
+
 function Exec-saveAs($p) {
     $wb = $global:excel.ActiveWorkbook
     if (-not $wb) { return @{success=$false; error="无活动工作簿"} }
-    try {
-        if (Test-Path $p.filePath) { Remove-Item $p.filePath -Force -ErrorAction SilentlyContinue }
-        $wb.SaveAs($p.filePath)
-        $sz = 0
-        if (Test-Path $p.filePath) { $sz = (Get-Item $p.filePath).Length }
-        return @{success=$true; data=@{path=$p.filePath; size=$sz}}
-    } catch { return @{success=$false; error=$_.Exception.Message} }
+    $writeResult = Invoke-ExcelSafeTargetWrite $p.filePath $p.overwrite { $wb.SaveAs($p.filePath) }
+    if (-not $writeResult.success) { return $writeResult }
+    $sz = (Get-Item -LiteralPath $p.filePath).Length
+    return @{success=$true; data=@{path=$p.filePath; size=$sz}}
 }
 function Exec-convertToPDF($p) {
     $wb = $global:excel.ActiveWorkbook
     if (-not $wb) { return @{success=$false; error="无活动工作簿"} }
     $out = if ($p.outputPath) { $p.outputPath } else { $wb.Path + '\' + $wb.Name + '.pdf' }
-    try {
-        if (Test-Path $out) { Remove-Item $out -Force -ErrorAction SilentlyContinue }
-        $wb.ExportAsFixedFormat(0, $out); return @{success=$true; data=@{path=$out}}
-    } catch { return @{success=$false; error=$_.Exception.Message} }
+    $writeResult = Invoke-ExcelSafeTargetWrite $out $p.overwrite { $wb.ExportAsFixedFormat(0, $out) }
+    if (-not $writeResult.success) { return $writeResult }
+    return @{success=$true; data=@{path=$out}}
 }
 function Exec-convertFormat($p) {
     $wb = $global:excel.ActiveWorkbook
     if (-not $wb) { return @{success=$false; error="无活动工作簿"} }
     $out = if ($p.outputPath) { $p.outputPath } else { $wb.Path + '\' + $wb.Name + '.' + $p.targetFormat }
-    try {
-        if (Test-Path $out) { Remove-Item $out -Force -ErrorAction SilentlyContinue }
-        $wb.SaveAs($out); return @{success=$true; data=@{path=$out}}
-    } catch { return @{success=$false; error=$_.Exception.Message} }
+    $writeResult = Invoke-ExcelSafeTargetWrite $out $p.overwrite { $wb.SaveAs($out) }
+    if (-not $writeResult.success) { return $writeResult }
+    return @{success=$true; data=@{path=$out}}
 }
 function Exec-reconnect($p) {
     try { $global:excel = $null; $global:excel = Get-ExcelApp } catch {}
@@ -973,6 +1019,14 @@ function Exec-reconnect($p) {
 function Exec-getSelectedText($p) { try { return @{success=$true; data=@{text=$global:excel.Selection.Text}} } catch { return @{success=$false; error=$_.Exception.Message} } }
 function Exec-setSelectedText($p) { try { $global:excel.Selection.Text = $p.text; return @{success=$true} } catch { return @{success=$false; error=$_.Exception.Message} } }
 function Exec-getAppInfo($p) { try { return @{success=$true; data=@{app="WPS表格"; version=$global:excel.Version}} } catch { return @{success=$false; error=$_.Exception.Message} } }
+
+function Test-ExcelActionRequiresActiveWorkbook($action) {
+    return $global:ExcelActionsWithoutActiveWorkbook -notcontains $action
+}
+
+function Get-ExcelActiveWorkbook {
+    try { return $global:excel.ActiveWorkbook } catch { return $null }
+}
 
 # ==================== 主循环（必须放在所有函数定义之后）====================
 # 从 stdin 读取 JSON 命令，执行后输出带 reqId 的 JSON 结果。
@@ -997,7 +1051,15 @@ while ($true) {
         $attempt = $cmd.attempt
         $traceId = $cmd.traceId
 
-        $result = & "Exec-$action" $params
+        if ((Test-ExcelActionRequiresActiveWorkbook $action) -and -not (Get-ExcelActiveWorkbook)) {
+            $result = @{
+                success=$false
+                code="NO_ACTIVE_DOCUMENT"
+                error="没有活动工作簿；请先创建或打开工作簿"
+            }
+        } else {
+            $result = & "Exec-$action" $params
+        }
         $sw.Stop()
         # 规范化结果，确保始终是带 reqId 的 hashtable，避免 ConvertTo-Json 产出空串/截断
         if ($null -eq $result) { $result = @{success=$true; data=$null} }

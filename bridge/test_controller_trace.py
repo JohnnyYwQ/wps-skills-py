@@ -5,6 +5,7 @@ import queue
 import tempfile
 import threading
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
@@ -34,7 +35,52 @@ class _RunningProcess:
         return None
 
 
+def _windows_com_resolution(executable, bitness=64):
+    return SimpleNamespace(
+        available=True,
+        powershell_executable=executable,
+        selected_view_bitness=bitness,
+        selected_registration=SimpleNamespace(clsid="{WPS-CLSID}"),
+        diagnostic="",
+    )
+
+
+def _ready_powershell_process(stdin=None):
+    process = Mock()
+    process.stdin = io.StringIO() if stdin is None else stdin
+    process.stdout = io.StringIO('{"ready":true}\n')
+    process.stderr = io.StringIO("")
+    process.pid = 4321
+    process.poll.return_value = None
+    process.wait.return_value = 0
+    return process
+
+
 class ControllerTraceTests(unittest.TestCase):
+    def test_excel_fake_process_receives_attach_first_startup_script(self):
+        resolution = _windows_com_resolution(
+            r"C:\\Windows\\System32\\powershell.exe",
+        )
+        process = _ready_powershell_process(_InputCapture())
+
+        with patch.object(wps_excel, "IS_WINDOWS", True), patch.object(
+            wps_excel, "IS_LINUX", False,
+        ), patch.object(
+            wps_excel, "resolve_com_runtime", return_value=resolution,
+        ), patch.object(wps_excel.subprocess, "Popen", return_value=process) as popen:
+            controller = wps_excel.WpsExcelController()
+            try:
+                script = Path(popen.call_args.args[0][-1]).read_text(encoding="utf-8-sig")
+            finally:
+                controller.close()
+
+        self.assertLess(
+            script.index("GetActiveObject('Ket.Application')"),
+            script.index("New-Object -ComObject 'Ket.Application'"),
+        )
+        self.assertNotIn("Workbooks.Add", script[:script.index("function Exec-ping")])
+        self.assertIn("EXIT\n", process.stdin.lines)
+
     def test_windows_controllers_launch_the_resolved_powershell_executable(self):
         cases = (
             (wps_excel, wps_excel.WpsExcelController),
@@ -42,22 +88,10 @@ class ControllerTraceTests(unittest.TestCase):
             (wps_word, wps_word.WpsWordController),
         )
         executable = r"C:\Windows\SysWOW64\WindowsPowerShell\v1.0\powershell.exe"
-        resolution = SimpleNamespace(
-            available=True,
-            powershell_executable=executable,
-            selected_view_bitness=32,
-            selected_registration=SimpleNamespace(clsid="{WPS-CLSID}"),
-            diagnostic="",
-        )
+        resolution = _windows_com_resolution(executable, bitness=32)
         for module, controller_type in cases:
             with self.subTest(controller=controller_type.__name__):
-                process = Mock()
-                process.stdin = io.StringIO()
-                process.stdout = io.StringIO('{"ready":true}\n')
-                process.stderr = io.StringIO("")
-                process.pid = 4321
-                process.poll.return_value = None
-                process.wait.return_value = 0
+                process = _ready_powershell_process()
                 with patch.object(module, "IS_WINDOWS", True), patch.object(
                     module,
                     "IS_LINUX",

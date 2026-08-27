@@ -1,4 +1,5 @@
 import json
+import re
 import tempfile
 import unittest
 from pathlib import Path
@@ -250,6 +251,73 @@ class ActionManifestValidationTests(unittest.TestCase):
             )
 
         self.assertIn("implementation.ppt.chartType", str(raised.exception))
+
+    def test_excel_contracts_expose_explicit_safe_overwrite(self):
+        catalog = ActionCatalog.from_path()
+
+        for action, path_field in (
+            ("saveAs", "filePath"),
+            ("convertToPDF", "outputPath"),
+            ("convertFormat", "outputPath"),
+        ):
+            with self.subTest(action=action):
+                contract = catalog.get("excel", action)
+                self.assertEqual("destructive", contract["risk"])
+                self.assertEqual(
+                    "boolean", contract["parameters"]["properties"]["overwrite"]["type"],
+                )
+                params = {"targetFormat": "xlsx"} if action == "convertFormat" else {}
+                if action == "saveAs":
+                    params[path_field] = r"C:\\tmp\\report.xlsx"
+                catalog.validate_params("excel", action, {**params, "overwrite": True})
+                with self.assertRaises(ActionValidationError):
+                    catalog.validate_params("excel", action, {**params, "overwrite": "yes"})
+
+    def test_excel_powershell_contract_preserves_active_workbook_and_targets(self):
+        script = wps_excel.PS_BRIDGE_SCRIPT
+        catalog = ActionCatalog.from_path()
+
+        self.assertLess(script.index("GetActiveObject('Ket.Application')"), script.index("New-Object -ComObject 'Ket.Application'"))
+        startup = script[:script.index("function Exec-ping")]
+        self.assertNotIn("Workbooks.Add", startup)
+        self.assertIn("NO_ACTIVE_DOCUMENT", script)
+        allowed_actions = re.search(
+            r"\$global:ExcelActionsWithoutActiveWorkbook = @\((.*?)\)",
+            script,
+            re.DOTALL,
+        )
+        self.assertIsNotNone(allowed_actions)
+        self.assertEqual(
+            {"ping"} | {
+                summary["action"]
+                for summary in catalog.list(owner="excel")
+                if "active_workbook" not in catalog.get(
+                    "excel", summary["action"],
+                )["prerequisites"]
+            },
+            set(re.findall(r'"([A-Za-z][A-Za-z0-9]*)"', allowed_actions.group(1))),
+        )
+        self.assertRegex(
+            script,
+            r'if \(\(Test-ExcelActionRequiresActiveWorkbook \$action\) -and -not \(Get-ExcelActiveWorkbook\)\) \{\s*\$result = @\{\s*success=\$false\s*code="NO_ACTIVE_DOCUMENT"',
+        )
+        self.assertRegex(
+            script,
+            re.compile(r"function Exec-createWorkbook\(\$p\).*Workbooks\.Add", re.DOTALL),
+        )
+        self.assertRegex(
+            script,
+            re.compile(r"function Exec-openWorkbook\(\$p\).*Workbooks\.Open", re.DOTALL),
+        )
+        self.assertNotRegex(script, r"\.Quit\s*\(")
+        self.assertNotIn("Remove-Item", script)
+        self.assertIn("function Invoke-ExcelSafeTargetWrite", script)
+        self.assertEqual(4, script.count("Invoke-ExcelSafeTargetWrite"))
+        self.assertIn("TARGET_EXISTS", script)
+        self.assertIn("OVERWRITE_NOT_SAFE", script)
+        self.assertIn("OVERWRITE_RESTORE_FAILED", script)
+        self.assertIn("[System.IO.File]::Copy($backupPath, $fullPath, $true)", script)
+        self.assertEqual(120, wps_excel.EXEC_TIMEOUT)
 
 
 if __name__ == "__main__":
