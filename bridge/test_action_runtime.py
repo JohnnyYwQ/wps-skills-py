@@ -394,6 +394,23 @@ class ActionRuntimeTests(unittest.TestCase):
         )
         self.assertTrue(all(controller.closed for controller in controllers.values()))
 
+    def test_bridge_action_rejects_an_explicit_application_before_controller_init(self):
+        initialized = []
+        runtime = ActionRuntime(controller_factory=lambda app, trace=None: (
+            initialized.append(app) or _RecordingController()
+        ))
+        try:
+            result = runtime.execute(ActionRequest(
+                action="ping",
+                app="excel",
+            )).to_dict()
+        finally:
+            runtime.close()
+
+        self.assertEqual("ACTION_NOT_SUPPORTED_FOR_APP", result["code"])
+        self.assertEqual(["bridge"], result["supportedApps"])
+        self.assertEqual([], initialized)
+
     def test_invalid_manifest_is_returned_as_stable_runtime_error(self):
         with patch.object(
             action_runtime.ActionCatalog,

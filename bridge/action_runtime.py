@@ -109,15 +109,6 @@ class ActionRuntime:
 
     def _resolve_route(self, action, params, requested_app):
         owners = self._catalog.owners_for(action)
-        if owners == ["bridge"]:
-            action_params = dict(params)
-            action_params.pop("app", None)
-            return {
-                "app": "bridge",
-                "source": "action_registry",
-                "supportedApps": ["bridge"],
-            }, action_params, None
-
         param_app = _normalize_app(params.get("app"))
         top_level_app = _normalize_app(requested_app)
         if top_level_app and param_app and top_level_app != param_app:
@@ -127,6 +118,21 @@ class ActionRuntime:
             )
 
         explicit_app = top_level_app or param_app
+        if owners == ["bridge"]:
+            if explicit_app and explicit_app != "bridge":
+                return None, None, _route_error(
+                    "ACTION_NOT_SUPPORTED_FOR_APP",
+                    f"应用 '{explicit_app}' 不支持 action '{action}'",
+                    ["bridge"],
+                )
+            action_params = dict(params)
+            action_params.pop("app", None)
+            return {
+                "app": "bridge",
+                "source": "action_registry",
+                "supportedApps": ["bridge"],
+            }, action_params, None
+
         if explicit_app and explicit_app not in _APP_MODULES:
             return None, None, _route_error(
                 "INVALID_APP",

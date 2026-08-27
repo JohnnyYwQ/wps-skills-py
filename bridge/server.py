@@ -176,14 +176,6 @@ def route_action(action, params=None, requested_app=None):
             "supportedApps": supported_apps,
         }, None
 
-    default_app = ACTION_CATALOG.routing_default(action)
-    if default_app in supported_apps:
-        return {
-            "app": default_app,
-            "source": "default",
-            "supportedApps": supported_apps,
-        }, None
-
     if len(supported_apps) > 1:
         return None, _route_error(
             "AMBIGUOUS_ACTION",
@@ -226,6 +218,38 @@ def _prepare_dispatch(action, params, app=None, trace=None):
 
     owners = ACTION_CATALOG.owners_for(action)
     if owners == ["bridge"]:
+        param_app = _normalize_app(params.get("app"))
+        requested_app = _normalize_app(app)
+        if requested_app and param_app and requested_app != param_app:
+            result = _route_error(
+                "CONFLICTING_APP",
+                f"顶层 app '{requested_app}' 与 params.app '{param_app}' 不一致",
+            )
+            if trace:
+                trace.event(
+                    "dispatch.rejected",
+                    status="error",
+                    code=result["code"],
+                    error=result["error"],
+                )
+            return None, result
+        explicit_app = requested_app or param_app
+        if explicit_app and explicit_app != "bridge":
+            result = _route_error(
+                "ACTION_NOT_SUPPORTED_FOR_APP",
+                f"应用 '{explicit_app}' 不支持 action '{action}'",
+                ["bridge"],
+            )
+            if trace:
+                trace.event(
+                    "route.rejected",
+                    status="error",
+                    action=action,
+                    code=result["code"],
+                    error=result["error"],
+                    supportedApps=result["supportedApps"],
+                )
+            return None, result
         action_params = dict(params)
         action_params.pop("app", None)
         if validate_windows_contract:
