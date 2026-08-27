@@ -4,6 +4,7 @@ from pathlib import Path
 import sys
 import json
 import os
+import errno
 import tempfile
 import io
 import urllib.error
@@ -14,7 +15,12 @@ from types import SimpleNamespace
 
 import server
 from action_trace import ActionTrace
-from service_lifecycle import BridgeLifecycle, current_service_identity
+from service_lifecycle import (
+    BridgeLifecycle,
+    ServiceStartResult,
+    build_service_identity,
+    current_service_identity,
+)
 
 SCRIPTS_DIR = Path(__file__).resolve().parents[1] / "scripts"
 sys.path.insert(0, str(SCRIPTS_DIR))
@@ -359,6 +365,48 @@ class CallServiceLifecycleRegressionTests(unittest.TestCase):
         self.assertEqual("unknown_owner", result.disposition)
         popen.assert_not_called()
 
+    def test_other_checkout_health_is_classified_as_foreign(self):
+        foreign_health = {
+            "status": "ok",
+            **build_service_identity(
+                "/workspace/other",
+                "foreign-code",
+                instance_id="foreign-instance",
+            ),
+        }
+        with patch.object(call, "_health", return_value=foreign_health), patch.object(
+            call.subprocess,
+            "Popen",
+        ) as popen:
+            result = call._ensure_server()
+
+        self.assertFalse(result)
+        self.assertEqual("foreign", result.disposition)
+        popen.assert_not_called()
+
+    def test_reuse_rejects_health_when_os_listener_identity_does_not_match(self):
+        health = {
+            "status": "ok",
+            **current_service_identity(instance_id="claimed-instance"),
+            "launchId": "claimed-launch",
+            "launchedByPid": 123,
+            "serverPath": call._server_path(),
+            "launchStartedAt": "2026-08-27T01:02:03.004Z",
+            "pid": 124,
+            "serverPid": 124,
+        }
+        wrong_listener = {"pid": 999, "createdAt": "other-process-time"}
+        with patch.object(call, "_health", return_value=health), patch.object(
+            call,
+            "_listener_identity",
+            return_value=wrong_listener,
+        ):
+            result = call._ensure_server()
+
+        self.assertFalse(result)
+        self.assertEqual("unknown_owner", result.disposition)
+        self.assertIn("监听 PID", result.error)
+
     def test_start_winner_reprobes_inside_lock_and_reuses_ready_bridge(self):
         ready_health = {
             "status": "ok",
@@ -379,6 +427,15 @@ class CallServiceLifecycleRegressionTests(unittest.TestCase):
             "_startup_lock",
             return_value=nullcontext(),
             create=True,
+        ), patch.object(
+            call,
+            "_listener_identity",
+            side_effect=[
+                {"pid": None, "createdAt": None},
+                {"pid": None, "createdAt": None},
+                {"pid": 124, "createdAt": "winner-time"},
+                {"pid": 124, "createdAt": "winner-time"},
+            ],
         ), patch.object(call.subprocess, "Popen") as popen:
             result = call._ensure_server()
 
@@ -421,8 +478,19 @@ class CallServiceLifecycleRegressionTests(unittest.TestCase):
             create=True,
         ), patch.object(
             call,
-            "_utc_timestamp",
+            "utc_timestamp",
             return_value="2026-08-27T01:02:03.004Z",
+        ), patch.object(
+            call,
+            "_listener_identity",
+            side_effect=[
+                {"pid": None, "createdAt": None},
+                {"pid": None, "createdAt": None},
+                {"pid": None, "createdAt": None},
+                {"pid": None, "createdAt": None},
+                {"pid": 456, "createdAt": "child-time"},
+                {"pid": 456, "createdAt": "child-time"},
+            ],
         ), patch.object(call.time, "sleep"):
             result = call._ensure_server()
 
@@ -648,8 +716,19 @@ class CallServiceLifecycleRegressionTests(unittest.TestCase):
             return_value=SimpleNamespace(hex="windows-launch"),
         ), patch.object(
             call,
-            "_utc_timestamp",
+            "utc_timestamp",
             return_value="2026-08-27T01:02:03.004Z",
+        ), patch.object(
+            call,
+            "_listener_identity",
+            side_effect=[
+                {"pid": None, "createdAt": None},
+                {"pid": None, "createdAt": None},
+                {"pid": None, "createdAt": None},
+                {"pid": None, "createdAt": None},
+                {"pid": 789, "createdAt": "child-time"},
+                {"pid": 789, "createdAt": "child-time"},
+            ],
         ), patch.object(call.time, "sleep"):
             result = call._ensure_server()
 
@@ -660,6 +739,61 @@ class CallServiceLifecycleRegressionTests(unittest.TestCase):
         self.assertEqual(0x200, kwargs["creationflags"])
         self.assertEqual(0x01, kwargs["startupinfo"].dwFlags)
         self.assertNotIn("start_new_session", kwargs)
+
+    def test_windows_startup_lock_retries_until_winner_releases_it(self):
+        locking = MagicMock(
+            side_effect=[OSError(errno.EACCES, "locked"), None, None]
+        )
+        fake_msvcrt = SimpleNamespace(
+            LK_NBLCK=1,
+            LK_UNLCK=2,
+            locking=locking,
+        )
+
+        with patch.object(call.sys, "platform", "win32"), patch.dict(
+            sys.modules,
+            {"msvcrt": fake_msvcrt},
+        ), patch.object(call.time, "sleep") as sleep:
+            with call._startup_lock():
+                pass
+
+        self.assertEqual(1, locking.call_args_list[0].args[1])
+        sleep.assert_called_once_with(0.05)
+
+    def test_startup_lock_failure_is_reported_as_unknown_owner(self):
+        with patch.object(call, "_health", return_value=None), patch.object(
+            call,
+            "_startup_lock",
+            side_effect=OSError(errno.EACCES, "lock denied"),
+        ), patch.object(call.subprocess, "Popen") as popen:
+            result = call._ensure_server()
+
+        self.assertFalse(result)
+        self.assertEqual("BRIDGE_START_LOCK_FAILED", result.code)
+        self.assertEqual("unknown_owner", result.disposition)
+        popen.assert_not_called()
+
+    def test_call_output_exposes_bridge_ensure_disposition(self):
+        service = ServiceStartResult(
+            True,
+            health={"instanceId": "instance-a", "launchId": "launch-a", "serverPid": 321},
+            disposition="reused",
+        )
+        with patch.object(call, "_load_params_from_args", return_value=("ping", {}, None)), patch.object(
+            call,
+            "_ensure_server",
+            return_value=service,
+        ), patch.object(
+            call,
+            "_post",
+            return_value={"success": True},
+        ), patch("builtins.print") as output, self.assertRaises(SystemExit) as exit_result:
+            call.main()
+
+        self.assertEqual(0, exit_result.exception.code)
+        payload = json.loads(output.call_args.args[0])
+        self.assertEqual("reused", payload["bridgeEnsure"]["disposition"])
+        self.assertEqual("instance-a", payload["bridgeEnsure"]["instanceId"])
 
 
 class HttpTraceTests(unittest.TestCase):

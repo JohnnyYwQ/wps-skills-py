@@ -16,7 +16,7 @@ WPS 统一 Skill 调用入口（胶水层）
 """
 
 from dataclasses import dataclass
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 import errno
 import sys
 import os
@@ -29,7 +29,6 @@ import subprocess
 import uuid
 import urllib.request
 import urllib.error
-from datetime import datetime, timezone
 
 BRIDGE_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "bridge")
 if BRIDGE_DIR not in sys.path:
@@ -42,6 +41,7 @@ from service_lifecycle import (
     bridge_port,
     current_service_identity,
     inspect_health,
+    utc_timestamp,
 )
 
 
@@ -174,10 +174,6 @@ def _server_path():
     return os.path.join(_project_root(), "bridge", "server.py")
 
 
-def _utc_timestamp():
-    return datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
-
-
 @contextmanager
 def _startup_lock():
     """Serialize bridge discovery and startup across independent callers."""
@@ -187,32 +183,42 @@ def _startup_lock():
         f"wps-skills-bridge-{safe_host}-{PORT}.lock",
     )
     lock_file = open(lock_path, "a+b")
+    locked = False
     try:
         if sys.platform == "win32":
             import msvcrt
 
-            lock_file.seek(0)
-            if lock_file.tell() == lock_file.seek(0, os.SEEK_END):
+            lock_file.seek(0, os.SEEK_END)
+            if lock_file.tell() == 0:
                 lock_file.write(b"\0")
                 lock_file.flush()
             lock_file.seek(0)
-            msvcrt.locking(lock_file.fileno(), msvcrt.LK_LOCK, 1)
+            while True:
+                try:
+                    msvcrt.locking(lock_file.fileno(), msvcrt.LK_NBLCK, 1)
+                    break
+                except OSError as exc:
+                    if exc.errno not in (errno.EACCES, errno.EAGAIN, errno.EDEADLK):
+                        raise
+                    time.sleep(0.05)
         else:
             import fcntl
 
             fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        locked = True
         yield
     finally:
         try:
-            lock_file.seek(0)
-            if sys.platform == "win32":
-                import msvcrt
+            if locked:
+                lock_file.seek(0)
+                if sys.platform == "win32":
+                    import msvcrt
 
-                msvcrt.locking(lock_file.fileno(), msvcrt.LK_UNLCK, 1)
-            else:
-                import fcntl
+                    msvcrt.locking(lock_file.fileno(), msvcrt.LK_UNLCK, 1)
+                else:
+                    import fcntl
 
-                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+                    fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
         finally:
             lock_file.close()
 
@@ -297,6 +303,26 @@ def _observable_identity_error(health):
     return None
 
 
+def _listener_ownership_error(observation, health):
+    target_pid = health.get("serverPid") if isinstance(health, dict) else None
+    before = observation.listener_before if isinstance(observation, HealthObservation) else None
+    after = observation.listener_after if isinstance(observation, HealthObservation) else None
+    if not isinstance(after, dict) or after.get("pid") != target_pid:
+        actual_pid = after.get("pid") if isinstance(after, dict) else None
+        return f"health 的 serverPid={target_pid} 与 probe 后监听 PID={actual_pid} 不一致"
+    if not after.get("createdAt"):
+        return f"无法确认监听 PID {target_pid} 的进程创建时间"
+    if isinstance(before, dict) and before.get("pid") is not None:
+        if before.get("pid") != target_pid:
+            return (
+                f"probe 期间监听 PID 从 {before.get('pid')} 变为 {target_pid}，"
+                "无法确认端口所有权"
+            )
+        if before.get("createdAt") != after.get("createdAt"):
+            return f"监听 PID {target_pid} 的进程创建时间在 probe 期间发生变化"
+    return None
+
+
 def _classify_existing_probe(observation, expected, trace=None, started=None):
     """Return a terminal result, or None when the port is confirmed absent."""
     if isinstance(observation, HealthObservation):
@@ -360,7 +386,10 @@ def _classify_existing_probe(observation, expected, trace=None, started=None):
         )
     inspection = inspect_health(health, expected=expected)
     if inspection.reusable:
-        identity_error = _observable_identity_error(health)
+        identity_error = _observable_identity_error(health) or _listener_ownership_error(
+            observation,
+            health,
+        )
         if identity_error:
             if trace:
                 trace.event(
@@ -420,8 +449,9 @@ def _ensure_server(trace=None):
     """确保当前 checkout 的 bridge 在运行；绝不复用身份不明的服务。"""
     started = time.perf_counter()
     expected = current_service_identity()
+    initial_observation = _observe_health()
     result = _classify_existing_probe(
-        _observe_health(),
+        initial_observation,
         expected,
         trace=trace,
         started=started,
@@ -429,7 +459,28 @@ def _ensure_server(trace=None):
     if result is not None:
         return result
 
-    with _startup_lock():
+    startup_stack = ExitStack()
+    try:
+        startup_stack.enter_context(_startup_lock())
+    except Exception as exc:
+        error = f"无法获得 bridge 跨进程启动锁: {type(exc).__name__}: {exc}"
+        if trace:
+            trace.event(
+                "bridge.start.lock_failed",
+                status="error",
+                error=error,
+                listenerBefore=initial_observation.listener_before,
+                listenerAfter=initial_observation.listener_after,
+            )
+        return ServiceStartResult(
+            False,
+            code="BRIDGE_START_LOCK_FAILED",
+            error=error,
+            disposition="unknown_owner",
+            listener_before=initial_observation.listener_before,
+            listener_after=initial_observation.listener_after,
+        )
+    with startup_stack:
         # 获得启动权后重新探测，关闭 probe 与 spawn 之间的 TOCTOU 窗口。
         result = _classify_existing_probe(
             _observe_health(),
@@ -457,7 +508,7 @@ def _start_server_locked(expected, trace=None, started=None):
         return ServiceStartResult(False, code="BRIDGE_START_FAILED", error=error)
 
     launch_id = uuid.uuid4().hex
-    launch_started_at = _utc_timestamp()
+    launch_started_at = utc_timestamp()
     launch_environment = os.environ.copy()
     launch_environment.update(
         {
@@ -540,7 +591,10 @@ def _start_server_locked(expected, trace=None, started=None):
         if inspection.reusable:
             process_pid = getattr(process, "pid", None)
             response_pid = health.get("serverPid", health.get("pid"))
-            identity_error = _observable_identity_error(health)
+            identity_error = _observable_identity_error(health) or _listener_ownership_error(
+                observation,
+                health,
+            )
             if identity_error:
                 _terminate_started_process(process)
                 if trace:
@@ -839,6 +893,18 @@ def _load_params_from_args(args):
     return action, params, app
 
 
+def _bridge_ensure_summary(service):
+    health = service.health if isinstance(service.health, dict) else {}
+    return {
+        "disposition": service.disposition,
+        "instanceId": health.get("instanceId"),
+        "launchId": health.get("launchId"),
+        "serverPid": health.get("serverPid"),
+        "listenerBefore": service.listener_before,
+        "listenerAfter": service.listener_after,
+    }
+
+
 def main():
     action, params, app = _load_params_from_args(sys.argv[1:])
     trace = ActionTrace.start(component="call")
@@ -851,11 +917,13 @@ def main():
     )
 
     service = _ensure_server(trace=trace)
+    bridge_ensure = _bridge_ensure_summary(service)
     if not service:
         result = {
             "success": False,
             "code": service.code,
             "error": service.error or "桥接服务启动失败，请检查 traceLog 与 server 日志",
+            "bridgeEnsure": bridge_ensure,
         }
         trace.event(
             "action.completed",
@@ -874,8 +942,13 @@ def main():
             trace=trace,
             service_health=service.health,
         )
+        result["bridgeEnsure"] = bridge_ensure
     except urllib.error.URLError as e:
-        result = {"success": False, "error": f"调用失败（服务无响应）: {e}"}
+        result = {
+            "success": False,
+            "error": f"调用失败（服务无响应）: {e}",
+            "bridgeEnsure": bridge_ensure,
+        }
         trace.event(
             "action.completed",
             status="error",
@@ -885,7 +958,11 @@ def main():
         print(json.dumps(trace.decorate(result), ensure_ascii=False))
         sys.exit(1)
     except Exception as e:
-        result = {"success": False, "error": f"调用失败: {e}"}
+        result = {
+            "success": False,
+            "error": f"调用失败: {e}",
+            "bridgeEnsure": bridge_ensure,
+        }
         trace.event(
             "action.completed",
             status="error",

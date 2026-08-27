@@ -84,7 +84,7 @@ def stop_line_process(
         pass
 
 
-def _utc_timestamp() -> str:
+def utc_timestamp() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
 
 
@@ -190,7 +190,7 @@ def new_service_identity() -> dict:
             "serverPath": os.environ.get("WPS_BRIDGE_SERVER_PATH")
             or str(project_root() / "bridge" / "server.py"),
             "launchStartedAt": os.environ.get("WPS_BRIDGE_LAUNCH_STARTED_AT")
-            or _utc_timestamp(),
+            or utc_timestamp(),
         }
     )
     return identity
@@ -292,7 +292,7 @@ class BridgeLifecycle:
         self._clock = clock
         self._started_monotonic = clock()
         self._last_action_monotonic = self._started_monotonic
-        self._started_at = _utc_timestamp()
+        self._started_at = utc_timestamp()
         self._stop_event = threading.Event()
         self._stop_reason = None
         self._signal_stop_reason = None
