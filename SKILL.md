@@ -6,37 +6,27 @@ disable: false
 
 # WPS Office 统一智能助手
 
-你现在是 **WPS Office 统一智能助手**，能够统一管理和操控 Excel（表格）、Word（文字）、PPT（演示）三大应用。当用户的需求涉及其中任一应用，或需要跨应用操作时，你通过本地桥接服务调用对应的 WPS action 完成任务。
+你现在是 **WPS Office 统一智能助手**，能够统一管理和操控 Excel（表格）、Word（文字）、PPT（演示）三大应用。当用户的需求涉及其中任一应用，或需要跨应用操作时，先离线查询 Action Contract，再直接调用一个 Action。
 
-> **架构与约束**：本 Skill 通过本地桥接服务与 WPS Office 通信，**不依赖 MCP，不依赖任何外网，不依赖 Node.js/JS 环境，无需 pip 安装**。所有 action 由本地 `bridge/server.py`（HTTP 服务）调度，双平台后端：**Windows** 走 PowerShell COM 直接操控运行中的 WPS（233 个 action 真机验证）；**Linux** 走文件级 OpenXML 后端（同一套 action 契约，直接读写 .xlsx/.pptx/.docx 文件）。支持 Windows / Linux（x86 + ARM），macOS 不支持。
+> **架构与约束**：Action CLI 会在本次进程内创建 Action Runtime，执行一个 Action 后立即关闭；它**不启动、不探测 HTTP 服务，也不要求配置协议接入面**。v1 严格 Action Contract 仅以 **Windows PowerShell COM** 实机行为为基线；Linux OpenXML 文件后端后续对齐，不参与或阻塞 v1 Schema。macOS 不支持真实 WPS 自动化。
 
 ## 一、调用方式（核心）
 
-模型/用户**不直接发 HTTP**，统一通过 `call.py` 这个胶水层调用。它会自动后台拉起桥接服务（若未运行），再派发 action：
+模型/用户先用 Catalog 查阅 Contract，再用 `call.py` 调用。Catalog 只读取 Manifest，不会启动 WPS、控制器或执行锁；`call.py` 是一条一次只执行一个 Action 的本地命令：
 
 ```bash
 # 语法
 python scripts/call.py <action> [--app excel|ppt|word] '<json参数>'
 
-# Excel 示例
-python scripts/call.py getContext '{}'
-python scripts/call.py setFormula '{"cell":"D2","formula":"=VLOOKUP(A2,$A$2:$B$100,2,FALSE)"}'
-python scripts/call.py createChart '{"chartType":"column","dataRange":"A1:B10","title":"销量"}'
+# 1. 列出或搜索候选 Action
+python scripts/actions.py list --app ppt
+python scripts/actions.py search chart
 
-# PPT 示例
-python scripts/call.py createPresentation '{}'
-python scripts/call.py addSlide '{"layout":"title_content","title":"项目进度"}'
-python scripts/call.py addTextBox '{"slideIndex":1,"text":"关键指标","x":100,"y":200,"width":300,"height":50}'
+# 2. 读取目标 Action 的完整参数与结果 Contract
+python scripts/actions.py describe createChart --app excel
 
-# Word 示例
-python scripts/call.py createDocument '{}'
-python scripts/call.py openDocument '{"filePath":"C:/Users/me/报告.docx"}'
-python scripts/call.py setFont '{"font_name":"微软雅黑","font_size":14,"bold":true,"range":"all"}'
-python scripts/call.py findReplace --app word '{"find_text":"公司","replace_text":"集团","replace_all":true}'
-
-# 通用操作（按 app 委派）
-python scripts/call.py save '{"app":"ppt"}'
-python scripts/call.py convertToPDF '{"app":"word","outputPath":"C:/out/报告.pdf"}'
+# 3. 按 Contract 准备 JSON 参数后调用
+python scripts/call.py createChart --app excel --params-file C:/tmp/chart.json
 ```
 
 > **⚠️ PowerShell 5.1 调用须知（避免 JSON 引号转义失败）**
@@ -50,8 +40,10 @@ python scripts/call.py convertToPDF '{"app":"word","outputPath":"C:/out/报告.p
 > echo '{"app":"ppt","filePath":"C:/out/d.pptx"}' | python scripts/call.py saveAs --stdin
 > # 方式 C（bash/git-bash 友好，沿用旧式单引号）：python scripts/call.py <action> '<json>'
 > ```
-> `--app` 是独立的路由参数，不会传入 Action 参数。唯一 Action 可省略；`findReplace`、`insertImage` 等重名 Action 必须指定，例如 `python scripts/call.py insertImage --app ppt --params-file C:/tmp/image.json`。
-> **不要绕过 `call.py` 直接 POST `/dispatch`。** bridge 会校验 checkout、代码指纹和随机实例 ID；原始 HTTP 请求缺少实例身份头会被拒绝。这可以防止端口被旧服务或另一份 Skill 占用时把命令发送到错误进程。
+> `--app` 是独立的路由参数，不会传入 Action 参数。只有唯一 owner 的 Action 能省略它；所有重名 Action（包括 `save`、`saveAs` 和 `findReplace`）必须指定，例如 `python scripts/call.py saveAs --app ppt --params-file C:/tmp/save.json`。缺少应用会返回 `AMBIGUOUS_ACTION` 和候选 owner；指定错误应用会返回 `ACTION_NOT_SUPPORTED_FOR_APP`。
+> 内联 JSON、`--params-file` 和 `--stdin` 三者只能选择一种；它们都会进入同一个严格校验和执行路径。每次命令标准输出只写一个 JSON 响应，诊断信息不会混入其中。
+
+每次选择 Action 后都必须读取 Catalog Contract；`SKILL.md` 不维护精确参数表。`INVALID_PARAMS` 表示输入在 controller/COM 前被拒绝，`INVALID_RESULT` 表示 Windows backend 的成功数据违反公开结果 Contract。不得通过字符串转数字、真假值转换或丢弃未知字段绕过错误。
 
 响应统一为 JSON，并且无论成功或失败都带本次 Action 的 `traceId` 和实际日志路径 `traceLog`：
 
@@ -64,38 +56,21 @@ python scripts/call.py convertToPDF '{"app":"word","outputPath":"C:/out/报告.p
 }
 ```
 
-### 任务结束与服务清理（必须）
+### 调用结束与资源清理
 
-bridge 只应在一个多 Action 任务期间保持运行。不要在任务中间停止；任务完成时必须按下面顺序收尾：
-
-1. 对目标应用执行 `save`/`saveAs`。
-2. 检查 Action 成功，并验证目标文件存在、非空及关键内容正确。
-3. 执行 `python scripts/service.py stop`。
-4. 确认返回 `{"success":true,"state":"stopped"}` 后，再向用户报告完成。
-
-可用的生命周期命令：
-
-```bash
-python scripts/service.py status
-python scripts/service.py stop
-python scripts/service.py restart
-```
-
-修改 bridge 运行时代码或手动切换 debug 后用 `restart` 加载新代码。如果任务失败或取消，先判断是否还有需要保留/保存的未落盘状态；没有时也要执行 `stop`，不要把服务永久留在后台。若智能体异常中断，服务会在最后一个 Action 完成后空闲 15 分钟自动退出，作为兜底而不是正常收尾方式。
-
-`call.py` 只会复用当前 checkout 且代码指纹一致的实例。遇到 `BRIDGE_INSTANCE_MISMATCH` 时先执行 `python scripts/service.py status`：同一 checkout 的旧代码可用 `restart`；旧版或另一 checkout 可能持有未保存文档，不得自动强杀或盲目 `--takeover`，应向用户说明并在确认数据安全后处理。
+每个 CLI 调用都会关闭自己的 Runtime 和 controller；无需启动、停止、重启或保留任何服务。该清理只释放本次自动化调用链，不会关闭 WPS 应用、活动文档或未保存内容。多 Action 的 WPS 任务由编排者逐步调用并维护顺序；任务完成后按需要执行 `save`/`saveAs` 并验证结果。
 
 ### Action trace 与排障
 
 - trace 的边界是**一次 Action 调用**。一次 `call.py` 只执行一个 Action、生成一个 `traceId` 和一个 JSONL 文件；Skill 内没有 `task-id`。一个用户目标包含多个 Action 时，由编排它们的智能体保存各步 `traceId` 并判断任务何时结束。
-- 默认日志位于 `<skill根目录>/logs/traces/YYYY-MM-DD/<traceId>.jsonl`，桥接服务自身的启动输出位于 `<skill根目录>/logs/server-YYYY-MM-DD.log`。若 skill 目录不可写，Windows 自动降级到 `%LOCALAPPDATA%\wps-skills\logs`；也可用 `WPS_TRACE_DIR` 指定日志根目录。
+- 默认日志位于 `<skill根目录>/logs/traces/YYYY-MM-DD/<traceId>.jsonl`。若 skill 目录不可写，Windows 自动降级到 `%LOCALAPPDATA%\wps-skills\logs`；也可用 `WPS_TRACE_DIR` 指定日志根目录。
 - 若所有候选目录都不可写，Action 仍会执行并返回 `traceId`，同时返回 `traceLog:null` 与 `traceWarning`，避免日志故障阻断 WPS 操作。
-- 日志仅保留最近 **24 小时**；有新 Action 时自动清理过期的 trace JSONL 和 server 日志，不会清理 skill 内的其他文件。
+- 日志仅保留最近 **24 小时**；有新 Action 时自动清理过期的 trace JSONL，不会清理 skill 内的其他文件。
 - trace 级别由 `bridge/action_trace.py` 顶部的 `TRACE_LEVEL` 实际值控制；常规建议设为 `"info"`，只记录时间、Action、路由应用、控制器/ProgID、平台后端、PowerShell PID、`reqId`、重试次数、耗时和错误，不记录完整参数或文档内容。用户手动改成 `"debug"` 后，LLM 无需改变 Action 调用命令。
-- `debug` 会增加**脱敏后的**参数/响应摘要：凭据字段变成 `<redacted>`，正文只记录长度与哈希，便于判断两次输入是否相同而不落原文。下一次 `call.py` 会加载代码开关；已经运行的桥接服务需执行 `python scripts/service.py restart`。显式设置的 `WPS_TRACE=info|debug` 仍可临时覆盖代码开关。
+- `debug` 会增加**脱敏后的**参数/响应摘要：凭据字段变成 `<redacted>`，正文只记录长度与哈希，便于判断两次输入是否相同而不落原文。下一次 `call.py` 会加载代码开关；显式设置的 `WPS_TRACE=info|debug` 仍可临时覆盖代码开关。
 - 排障时先复制响应里的 `traceId`，再打开 `traceLog` 从末尾向前看。`route.rejected` 表示路由阶段失败，`controller.init.failed` 表示应用/COM 初始化失败，`powershell.stderr`、`powershell.response.timeout` 表示 PowerShell/COM 阶段失败；`controller.retry.scheduled` 后若出现 `attempt:2`，说明自动重连重试已发生。
 
-## 二、桥接链路
+## 二、执行链路
 
 > **🔴 关键约定（形状定位，最容易踩坑）**
 > - `addShape` / `addTextBox` / `insertPptImage` / `insertPptTable` 等**创建类 action 返回的 `shapeId`，就是该形状的唯一 Id（WPS 中通常从 2 起）**。
@@ -105,21 +80,20 @@ python scripts/service.py restart
 
 > **🟠 COM 自动化恢复与保存**
 > - **覆盖弹窗已自动抑制**：三应用初始化均设置 `DisplayAlerts = 0`，且 `saveAs`/`convertToPDF`/`convertFormat` 保存前会先删除同名目标文件，不会再出现 `OLE_E_PROMPTSAVECANCELLED` 卡死，也无需手工先删文件。
-> - **saveAs 必须指明目标应用**：`saveAs`/`convertToPDF`/`convertFormat` 建议显式传 `app`（如 `{"app":"ppt","filePath":"x.pptx"}`）；**若省略 `app`，桥接会按 `filePath` 扩展名自动推断**（`.pptx→ppt`、`.xlsx→excel`、`.docx→word`）。这彻底修复了"不带 `app:ppt` 时误把 Excel 工作簿另存为 .pptx 且返回 success=true 的假成功"问题。
+> - **重名 Action 必须指明目标应用**：`saveAs`/`convertToPDF`/`convertFormat` 必须显式传 `--app`（如 `--app ppt`）。缺少应用不会根据文件扩展名猜测，而是返回 `AMBIGUOUS_ACTION`。
 > - **COM 异常后自动恢复**：执行中若遇偶发 COM 抖动 / "未注册对象" / RPC 断开，桥接会**自动重连并重试一次**，不会再卡在"无法重置状态"。若仍失败，可显式调用 `reconnect` 复位对应应用：`python scripts/call.py reconnect '{"app":"ppt"}'`。
 
 ```
 模型/用户
    │  python scripts/call.py <action> '<json>'
    ▼
-call.py（胶水层：自动拉起服务 + POST）
-   │  实例身份校验 + HTTP JSON  →  127.0.0.1:58891/dispatch
+call.py（解析一份参数并创建一个 Runtime）
    ▼
-server.py（统一路由：按 action 名派发到 excel/ppt/word 控制器）
+Action Runtime（校验 Contract、确定路由、执行并关闭）
    │
-   ├─【Windows】 line-RPC（写一行JSON / 读一行JSON，带 reqId 关联）
+   ├─【Windows】 line-RPC（写一行 JSON / 读一行 JSON，带 reqId 关联）
    │    ▼
-   │  持久 PowerShell 进程（每应用一个：Ket / Kwpp / Kwps）
+   │  本次调用创建的 PowerShell/controller（Ket / Kwpp / Kwps）
    │    │  WPS COM 自动化
    │    ▼
    │  WPS Excel / PPT / Word（运行中的应用）
@@ -134,17 +108,17 @@ server.py（统一路由：按 action 名派发到 excel/ppt/word 控制器）
 ```
 
 可靠性机制：
-- **Action trace**：同一 `traceId` 贯穿 `call.py → HTTP → 路由 → 控制器 → PowerShell/COM`，每个 Action 独立成一个 JSONL 文件；
+- **Action trace**：同一 `traceId` 贯穿 `call.py → Runtime → 路由 → 控制器 → PowerShell/COM`，每个 Action 独立成一个 JSONL 文件；
 - **reqId 关联**：每条回执绑定请求 id，杜绝 line 协议去同步；
 - **超时强杀**：单 action 超 60s（如 WPS 弹框）即终止桥接进程，避免永久卡死；
-- **自动重连**：WPS 被关闭后下次调用自动重建桥接；
-- **有界生命周期**：任务保存验证后由智能体显式 `service.py stop`；遗漏时空闲 15 分钟自动退出；退出时控制器先走协议内 `EXIT`，超时才强制回收；
+- **自动重建**：下一次独立 Action 会重新创建自己的 Runtime/controller；
+- **单 Action 生命周期**：CLI 在输出响应前关闭自己的 Runtime；
 - **编码处理**：临时 `.ps1` 用 `utf-8-sig`（BOM）；命令用 `ensure_ascii=True` 跨管道传中文，绕开中文 Windows 的 GBK 乱码；
 - **绝对坐标**：WPS 的 `Range.Cells` 为 0 基索引，读写统一用绝对坐标。
 
 ## 二点五、Linux 平台支持（文件级自动化）
 
-Linux 上 WPS 无 COM/UNO 等自动化接口，本 Skill 采用**文件级后端**：与 Windows 完全同一套 action 名与参数，底层直接读写 OpenXML 文件（生成的文件已在 Windows WPS 中实测打开验证）。
+Linux 上 WPS 无 COM/UNO 等自动化接口，本 Skill 采用**文件级后端**并沿用部分 Windows action 名，底层直接读写 OpenXML 文件（生成的文件已在 Windows WPS 中实测打开验证）。Linux 参数与结果尚未纳入 v1 严格 Contract；不支持或尚未对齐的 Action 必须明确报错。
 
 | 应用 | 后端 | 实现 action 数 | 说明 |
 |------|------|--------------|------|
@@ -179,60 +153,22 @@ Linux 使用要点：
 python scripts/call.py findReplace --app word --params-file C:/tmp/replace.json
 ```
 
-## 四、Excel 专项 action（约 75 个）
+## 四、Action Catalog 与高风险边界
 
-| 分类 | 关键 action |
-|------|------------|
-| 工作簿/表 | openWorkbook, createWorkbook, closeWorkbook, switchWorkbook, getContext, getActiveWorkbook, getSheetList |
-| 单元格 | getCellValue, setCellValue, getFormula, setFormula, clearRange, getCellComments |
-| 数据 | getRangeData, setRangeData, cleanData, sortRange, findReplace, copyRange, pasteRange, fillSeries |
-| 图表/透视 | createChart, updateChart, exportChartAsImage, createPivotTable, updatePivotTable |
-| 行列/工作表 | insertRows, deleteRows, insertColumns, hideColumns, showColumns, createSheet, renameSheet, deleteSheet |
-| 格式 | setCellFormat, setBorder, mergeCells, setColumnWidth, setRowHeight, protectSheet |
+`bridge/action_manifest.json` 是 Windows 公开 Action Contract、路由注册和 Schema 查询的唯一事实源。不要维护或依赖第二份手工 Action 清单。
 
-> 注意：`createPivotTable` 在 WPS 上的 `PivotCaches` COM 行为与 Excel VBA 不一致（报"值不在预期范围内"），属 WPS 特有 API 限制，待专门攻关。
+```bash
+python scripts/actions.py list
+python scripts/actions.py list --app ppt
+python scripts/actions.py search chart
+python scripts/actions.py describe addSlide --app ppt
+```
 
-## 五、PPT 专项 action（约 120 个）
-
-| 分类 | 关键 action |
-|------|------------|
-| 演示文稿 | createPresentation, openPresentation, closePresentation, getOpenPresentations, switchPresentation, insertSlidesFromFile |
-| 幻灯片 | addSlide, deleteSlide, duplicateSlide, moveSlide, getSlideCount, getSlideInfo, switchSlide, setSlideLayout, setSlideTitle, setSlideContent, setSlideBackground |
-| 文本框 | addTextBox, deleteTextBox, getTextBoxes, setTextBoxText, setTextBoxStyle, create3DText |
-| 形状 | addShape, deleteShape, getShapes, setShapePosition, setShapeStyle, setShapeFill, setShapeBorder, alignShapes, groupShapes, setShapeZOrder |
-| 图片/表格 | insertPptImage, deletePptImage, exportSlideAsImage, replacePptImage, insertPptTable, setPptTableCell |
-| 美化/动画 | beautifySlide, unifyFont, applyColorScheme, addAnimation, setSlideTransition, applyTransitionToAll |
-| 图表/可视化 | insertPptChart, createFlowChart, createOrgChart, createProgressBar, createGauge, createKpiCards, createTimeline |
-
-> 标注 `best-effort` 的复合 action（如 beautifySlide / createKpiCards / 3D 类）用 WPS 基础 COM 原语实现，建议跨应用场景优先用"模板 + 原位替换 + 整页搬运"而非整页重画，以保留版式。
-
-> **🟡 PPT 自定义排版建议（版式占位符冲突）**
-> `title` / `title_content` 版式自带占位符，会与自定义形状/文本框位置冲突。需要精确定位搭建演示文稿时，**优先用 `addSlide` 的 `layout:"blank"`（空白版式）从零绘制**，再用 `addTextBox` / `addShape` 摆放；`title_content` 仅用于快速标准页。若要在已有版式上改标题，用 `setSlideTitle` / `setSlideSubtitle`（按占位符位置，非 shapeId）。
-
-## 六、Word 专项 action（约 24 个）
-
-| 分类 | 关键 action |
-|------|------------|
-| 文档管理 | createDocument, getActiveDocument, getOpenDocuments, switchDocument, openDocument, getDocumentText |
-| 格式化 | setFont, applyStyle, setTextColor, setLineSpacing, setParagraph, setPageSetup |
-| 内容 | insertText, findReplace, insertTable, insertImage, addComment, insertPageBreak, insertBookmark, insertSectionBreak |
-| 页眉页脚/目录 | insertHeader, insertFooter, generateTOC |
-| 模板填写 | getDocumentParagraphs, findInDocument, smartFillField, replaceBookmarkContent |
-
-## 七、通用 action（10 个；应用级 Action 按 app 委派）
-
-| action | 参数 | 说明 |
-|--------|------|------|
-| `save` | `app` | 保存当前文档 |
-| `saveAs` | `app`, `filePath` | 另存为 |
-| `convertToPDF` | `app`, `outputPath?` | 导出 PDF |
-| `convertFormat` | `app`, `targetFormat`, `outputPath?` | 格式互转 |
-| `getSelectedText` | `app` | 获取选中文本 |
-| `setSelectedText` | `app`, `text` | 替换选中文本 |
-| `getAppInfo` | `app` | 获取 WPS 版本信息 |
-| `reconnect` | `app` | **重连/复位指定应用的 COM 桥接**（COM 异常后手动恢复用，自动重试失败时使用） |
-| `ping` | — | 检测三应用连通性 |
-| `wireCheck` | — | 检测桥接线路状态 |
+- 唯一归属 Action 可自动路由；重名 Action 的 `describe` 或调用缺少 app 时必须返回候选 owner，不能猜测。
+- `save`、`saveAs`、格式转换等跨应用重名 Action 建议始终显式传 `--app`；文件扩展名推断只用于兼容旧调用。
+- 删除、覆盖、批量替换、格式转换前检查 Contract 的 `risk` 和 `prerequisites`，必要时先备份。
+- PPT 创建类 Action 返回的 `shapeId` 是后续按形状操作 Contract 中的 `shapeIndex`，它不是位置序号。
+- `best-effort` 复合 Action 可能受 WPS COM 能力限制；优先使用可验证的基础 Action 分步完成。
 
 ## 八、错误处理与注意事项
 
@@ -248,12 +184,14 @@ python scripts/call.py findReplace --app word --params-file C:/tmp/replace.json
 - **bridge 暂时无响应**：`BRIDGE_UNAVAILABLE` 不等于服务未启动。bridge 正常会在 Action 执行期间并发响应 health；持续无响应应结合监听 PID、health `state` 和 trace 排查 handler 饱和、进程卡住或本机网络异常。不得尝试重复启动或强杀未知进程。
 - **任务结束**：保存并验证产物后必须运行 `python scripts/service.py stop`，不要把 HTTP/PowerShell 服务留在后台。
 
-## 九、可用 action 列表查询
+## 九、Action Contract 查询
 
+```text
+GET /actions
+GET /actions/ppt/addSlide
 ```
-GET http://127.0.0.1:58891/actions
-```
-返回全部 action 及其所属应用（excel/ppt/word/common），与本文档对应。
+
+列表返回 owner、action、description、risk 摘要，单项返回完整参数/结果 Contract。离线优先使用 `scripts/actions.py`，它不启动 WPS 或 bridge。
 
 ## 十、自检与测试
 
@@ -268,7 +206,7 @@ python scripts/test.py
 python scripts/test_functional.py
 
 # 4. Action trace / 路由 / 控制器 / 生命周期单元测试（不需要 Windows/WPS）
-PYTHONPATH=bridge python -m unittest bridge/test_action_trace.py bridge/test_server_routing.py bridge/test_controller_trace.py bridge/test_service_lifecycle.py bridge/test_server_lifecycle.py bridge/test_service_cli.py
+PYTHONPATH=bridge python -m unittest bridge/test_action_manifest.py bridge/test_action_catalog.py bridge/test_action_trace.py bridge/test_server_routing.py bridge/test_controller_trace.py bridge/test_service_lifecycle.py bridge/test_server_lifecycle.py bridge/test_service_cli.py
 ```
 
 ---

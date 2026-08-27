@@ -36,7 +36,7 @@ def check_platform():
     a = platform.machine()
     print(f"  平台: {s} {a}")
     if s == "Windows":
-        print("  [OK] Windows 平台（通过 PowerShell COM 控制 WPS，233 个 action）")
+        print("  [OK] Windows 平台（PowerShell COM：233 个应用 Action + 2 个 bridge Contract）")
         return True
     elif s == "Linux":
         if a in ("x86_64", "aarch64", "arm64"):
@@ -106,6 +106,9 @@ def check_files():
     files = [
         ("SKILL.md", "技能定义文件"),
         ("bridge/action_trace.py", "Action 结构化追踪与 24 小时保留"),
+        ("bridge/action_catalog.py", "Action Contract Catalog 与校验器"),
+        ("bridge/action_manifest.json", "Windows Action Contract 唯一事实源"),
+        ("bridge/powershell_contracts.py", "共享 PowerShell 契约枚举转换"),
         ("bridge/service_lifecycle.py", "bridge 实例身份与生命周期"),
         ("bridge/windows_com.py", "Windows COM 注册视图与 PowerShell 解析"),
         ("bridge/server.py", "统一桥接服务"),
@@ -117,6 +120,7 @@ def check_files():
         ("bridge/linux_ppt.py", "Linux PPT 后端（OpenXML）"),
         ("bridge/linux_word.py", "Linux Word 后端（OpenXML）"),
         ("scripts/call.py", "Action 调用入口"),
+        ("scripts/actions.py", "Action Contract 查询入口"),
         ("scripts/service.py", "bridge 生命周期命令"),
         ("vendor/openpyxl/__init__.py", "vendored openpyxl（Linux Excel 后端依赖，无需 pip）"),
         ("vendor/et_xmlfile/__init__.py", "vendored et_xmlfile（openpyxl 依赖）"),

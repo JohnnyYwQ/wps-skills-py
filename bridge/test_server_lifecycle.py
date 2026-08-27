@@ -36,7 +36,7 @@ class _RecordingController:
     def execute(self, action, params, trace=None):
         if self.clock:
             self.clock.advance(self.duration)
-        return {"success": True, "data": {"action": action}}
+        return {"success": True, "data": {}}
 
     def close(self):
         self.closed = True
@@ -124,6 +124,28 @@ class ShutdownEndpointTests(unittest.TestCase):
         )
         self.assertEqual(os.getpid(), events[-1]["serverPid"])
         self.assertGreaterEqual(events[-1]["elapsedMs"], 0)
+
+    def test_action_endpoints_return_manifest_summary_and_full_contract(self):
+        listing, listed = _handler("/actions", self.lifecycle)
+        listing.do_GET()
+
+        self.assertEqual(200, listed["code"])
+        add_slide_summary = next(
+            item for item in listed["result"]["actions"]
+            if item["owner"] == "ppt" and item["action"] == "addSlide"
+        )
+        self.assertEqual(
+            {"owner", "action", "description", "risk"},
+            set(add_slide_summary),
+        )
+
+        detail, described = _handler("/actions/ppt/addSlide", self.lifecycle)
+        detail.do_GET()
+
+        self.assertEqual(200, described["code"])
+        self.assertEqual("ppt", described["result"]["owner"])
+        self.assertIn("parameters", described["result"])
+        self.assertIn("result", described["result"])
 
     def test_shutdown_requests_graceful_exit(self):
         handler, captured = _handler(
@@ -505,7 +527,10 @@ class ServerLoopTests(unittest.TestCase):
         handler, captured = _handler(
             "/dispatch",
             lifecycle,
-            payload={"action": "setCellValue", "params": {"cell": "A1", "value": 1}},
+            payload={
+                "action": "setCellValue",
+                "params": {"row": 1, "col": 1, "value": 1},
+            },
         )
         controller = _RecordingController(clock=clock, duration=20)
 
