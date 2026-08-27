@@ -166,6 +166,16 @@ class BridgeLifecycleTests(unittest.TestCase):
 
         self.assertFalse(self.lifecycle.should_stop())
 
+    def test_active_action_can_exceed_idle_timeout_without_stopping(self):
+        with self.lifecycle.action_execution("setCellValue", "trace-active") as admitted:
+            self.assertTrue(admitted)
+            self.clock.advance(20)
+
+            self.assertFalse(self.lifecycle.should_stop())
+
+        self.clock.advance(9)
+        self.assertFalse(self.lifecycle.should_stop())
+
     def test_health_snapshot_does_not_reset_idle_deadline(self):
         self.clock.advance(9)
         snapshot = self.lifecycle.health_snapshot()
@@ -173,6 +183,24 @@ class BridgeLifecycleTests(unittest.TestCase):
 
         self.assertEqual("ok", snapshot["status"])
         self.assertTrue(self.lifecycle.should_stop())
+
+    def test_health_distinguishes_idle_running_and_stopping(self):
+        self.assertEqual("idle", self.lifecycle.health_snapshot()["state"])
+
+        with self.lifecycle.action_execution("setCellValue", "trace-active"):
+            running = self.lifecycle.health_snapshot()
+
+            self.assertEqual("running", running["state"])
+            self.assertEqual("trace-active", running["activeAction"]["traceId"])
+            self.assertEqual("setCellValue", running["activeAction"]["action"])
+            self.assertIn("startedAt", running["activeAction"])
+            self.assertEqual(
+                {"traceId", "action", "startedAt"},
+                set(running["activeAction"]),
+            )
+
+        self.lifecycle.request_stop("api")
+        self.assertEqual("stopping", self.lifecycle.health_snapshot()["state"])
 
     def test_explicit_shutdown_is_idempotent(self):
         self.lifecycle.request_stop("api")

@@ -8,7 +8,7 @@ WPS 统一桥接服务（HTTP）
   - ping / wireCheck 在 server 层聚合三应用连通性
 
 模型/用户通过 scripts/call.py 调用，无需直接发 HTTP。
-单线程 HTTPServer：底层 PowerShell 子进程是单 line 协议，多线程会交错写 stdin 导致协议崩。
+HTTP handler 有界并发；Action 仍严格串行进入 controller，避免 PowerShell 单行协议交错。
 """
 
 import json
@@ -20,6 +20,7 @@ import socket
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
+from socketserver import ThreadingMixIn
 from urllib.parse import urlparse
 
 # 把 bridge 目录加入导入路径
@@ -43,6 +44,7 @@ PORT = bridge_port()
 EXEC_TIMEOUT = 60
 MAX_REQUEST_BYTES = 16 * 1024 * 1024
 REQUEST_IO_TIMEOUT_SECONDS = 10
+MAX_HTTP_HANDLER_THREADS = 16
 
 # 从各控制器内嵌的 PS 脚本中解析出支持的 action 列表
 def _actions_from_module(mod):
@@ -208,8 +210,8 @@ def route_action(action, params=None, requested_app=None):
     }, None
 
 
-def dispatch(action, params, app=None, trace=None):
-    """统一派发入口"""
+def _prepare_dispatch(action, params, app=None, trace=None):
+    """无副作用地校验并路由 Action；不接触 controller。"""
     dispatch_started = time.perf_counter()
     if trace:
         trace.event("dispatch.started", action=action, requestedApp=app)
@@ -217,7 +219,7 @@ def dispatch(action, params, app=None, trace=None):
         result = {"success": False, "code": "MISSING_ACTION", "error": "缺少 action 参数"}
         if trace:
             trace.event("dispatch.rejected", status="error", code=result["code"], error=result["error"])
-        return result
+        return None, result
 
     if params is None:
         params = {}
@@ -225,12 +227,16 @@ def dispatch(action, params, app=None, trace=None):
         result = _route_error("INVALID_PARAMS", "params 必须是 JSON object")
         if trace:
             trace.event("dispatch.rejected", status="error", code=result["code"], error=result["error"])
-        return result
+        return None, result
 
-    if action == "ping":
-        return handle_ping(trace=trace)
-    if action == "wireCheck":
-        return handle_ping(trace=trace)  # wireCheck 与 ping 同源：检测桥接线路
+    if action in SERVER_ACTIONS:
+        return {
+            "action": action,
+            "params": params,
+            "requestedApp": app,
+            "route": None,
+            "started": dispatch_started,
+        }, None
 
     route, route_error = route_action(action, params, requested_app=app)
     if route_error:
@@ -243,18 +249,39 @@ def dispatch(action, params, app=None, trace=None):
                 error=route_error.get("error"),
                 supportedApps=route_error.get("supportedApps"),
             )
-        return route_error
+        return None, route_error
 
-    selected_app = route["app"]
     if trace:
         trace.event(
             "route.selected",
             action=action,
-            app=selected_app,
+            app=route["app"],
             source=route["source"],
             supportedApps=route["supportedApps"],
         )
+    return {
+        "action": action,
+        "params": params,
+        "requestedApp": app,
+        "route": route,
+        "started": dispatch_started,
+    }, None
 
+
+def dispatch(action, params, app=None, trace=None, prepared=None):
+    """统一派发入口。prepared 仅供 HTTP handler 复用锁外校验结果。"""
+    if prepared is None:
+        prepared, rejection = _prepare_dispatch(action, params, app=app, trace=trace)
+        if rejection is not None:
+            return rejection
+
+    action = prepared["action"]
+    params = prepared["params"]
+    if prepared["route"] is None:
+        return handle_ping(trace=trace)
+
+    route = prepared["route"]
+    selected_app = route["app"]
     controller_started = time.perf_counter()
     try:
         ctrl = get_app_controller(selected_app, trace=trace)
@@ -313,7 +340,7 @@ def dispatch(action, params, app=None, trace=None):
             code=result.get("code"),
             error=result.get("error"),
             elapsedMs=round((time.perf_counter() - execute_started) * 1000, 2),
-            dispatchElapsedMs=round((time.perf_counter() - dispatch_started) * 1000, 2),
+            dispatchElapsedMs=round((time.perf_counter() - prepared["started"]) * 1000, 2),
             **trace.debug_fields(response=result),
         )
     return result
@@ -402,10 +429,7 @@ class Handler(BaseHTTPRequestHandler):
         if identity_error:
             self._send(identity_error[0], identity_error[1])
             return
-        try:
-            self._handle_dispatch()
-        finally:
-            self.server.lifecycle.mark_action_completed()
+        self._handle_dispatch()
 
     def _validate_instance_headers(self):
         lifecycle = self.server.lifecycle
@@ -446,8 +470,8 @@ class Handler(BaseHTTPRequestHandler):
         try:
             self._send(result, 202)
         finally:
-            # 单线程 HTTPServer 不能在 handler 内调用 shutdown()；主循环会在
-            # 当前响应返回后观察到该标记并退出。
+            # 主循环会在当前响应返回后观察到该标记并停止接受新连接；
+            # server_close() 随后等待已启动的 handler 完成。
             lifecycle.request_stop("api")
 
     def _handle_dispatch(self):
@@ -535,7 +559,35 @@ class Handler(BaseHTTPRequestHandler):
                 bodyTraceId=body_trace_id,
             )
 
-        result = dispatch(action, params, app=app, trace=trace)
+        prepared, rejection = _prepare_dispatch(action, params, app=app, trace=trace)
+        if rejection is not None:
+            trace.event(
+                "http.response.ready",
+                status="error",
+                action=action,
+                code=rejection.get("code"),
+                error=rejection.get("error"),
+                elapsedMs=round((time.perf_counter() - request_started) * 1000, 2),
+            )
+            self._send(trace.decorate(rejection))
+            return
+
+        lifecycle = self.server.lifecycle
+        with lifecycle.action_execution(action, trace.trace_id) as admitted:
+            if not admitted:
+                self._send(trace.decorate({
+                    "success": False,
+                    "code": "BRIDGE_SHUTTING_DOWN",
+                    "error": "bridge 正在关闭，请稍后重试",
+                }), 503)
+                return
+            result = dispatch(
+                action,
+                params,
+                app=app,
+                trace=trace,
+                prepared=prepared,
+            )
         trace.event(
             "http.response.ready",
             status="success" if result.get("success") else "error",
@@ -550,14 +602,40 @@ class Handler(BaseHTTPRequestHandler):
         pass  # 静默
 
 
-class BridgeHTTPServer(HTTPServer):
+class BridgeHTTPServer(ThreadingMixIn, HTTPServer):
+    daemon_threads = False
+    block_on_close = True
+
     # Windows 的 SO_REUSEADDR 可能允许第二监听者抢占相同端口；Unix 保留
     # reuse 以避免服务正常重启被 TIME_WAIT 阻断。
     allow_reuse_address = os.name != "nt"
 
-    def __init__(self, server_address, handler_class, lifecycle):
+    def __init__(
+        self,
+        server_address,
+        handler_class,
+        lifecycle,
+        max_handler_threads=MAX_HTTP_HANDLER_THREADS,
+    ):
         self.lifecycle = lifecycle
+        self._handler_slots = threading.BoundedSemaphore(max_handler_threads)
         super().__init__(server_address, handler_class)
+
+    def process_request(self, request, client_address):
+        if not self._handler_slots.acquire(blocking=False):
+            self.shutdown_request(request)
+            return
+        try:
+            super().process_request(request, client_address)
+        except Exception:
+            self._handler_slots.release()
+            raise
+
+    def process_request_thread(self, request, client_address):
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self._handler_slots.release()
 
     def server_bind(self):
         if os.name == "nt":
@@ -574,7 +652,7 @@ class BridgeHTTPServer(HTTPServer):
 
 
 def serve_until_stopped(httpd, lifecycle, poll_interval=0.25):
-    """单线程请求循环；Action 执行期间不会并发触发 idle shutdown。"""
+    """接受请求直至停止；handler 并发，Action 生命周期由 lifecycle 串行协调。"""
     httpd.timeout = poll_interval
     while not lifecycle.should_stop():
         httpd.handle_request()

@@ -245,7 +245,7 @@ python scripts/call.py findReplace --app word --params-file C:/tmp/replace.json
 - **跨应用确认**：跨应用操作前确认数据来源与目标。
 - **批量谨慎**：批量操作前建议备份，确认覆盖。
 - **bridge 身份冲突**：`BRIDGE_INSTANCE_MISMATCH` 表示端口上是旧版、旧代码或另一 checkout；不要继续直发 HTTP。先运行 `service.py status`，只对确认安全的当前 checkout 使用 `restart`。
-- **bridge 暂时无响应**：`BRIDGE_UNAVAILABLE` 不等于服务未启动，通常是单线程 bridge 正在执行另一个长 Action。不得尝试重复启动或强杀；等待该 Action 完成后重试 `service.py status`/原 Action。
+- **bridge 暂时无响应**：`BRIDGE_UNAVAILABLE` 不等于服务未启动。bridge 正常会在 Action 执行期间并发响应 health；持续无响应应结合监听 PID、health `state` 和 trace 排查 handler 饱和、进程卡住或本机网络异常。不得尝试重复启动或强杀未知进程。
 - **任务结束**：保存并验证产物后必须运行 `python scripts/service.py stop`，不要把 HTTP/PowerShell 服务留在后台。
 
 ## 九、可用 action 列表查询

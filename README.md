@@ -82,7 +82,8 @@ python scripts/service.py restart
 
 - `call.py` 会校验 checkout 路径、代码指纹和随机实例 ID，不会再把另一目录、旧代码或旧版 `{"status":"ok"}` 服务误认为当前服务。
 - `/dispatch` 和 `/shutdown` 都要求实例身份请求头，避免健康检查后实例被替换时把命令发错进程；普通调用统一走 `call.py`。
-- 健康检查超时会报告 `BRIDGE_UNAVAILABLE`，不会被误判为“未启动”并拉起第二实例；这通常表示单线程 bridge 正在执行长 Action，稍后重试即可。
+- 健康检查超时会报告 `BRIDGE_UNAVAILABLE`，不会被误判为“未启动”并拉起第二实例；bridge 会并发处理 `/health`，因此持续超时表示 handler 已饱和、进程卡住或本机网络链路异常，需要结合监听 PID 和 trace 排查。
+- `/health` 的 `state` 区分 `idle`、`running` 和 `stopping`；运行中还会返回 `activeAction.traceId`、Action 名称和开始时间，不包含 Action 参数。
 - 正常停止会关闭 Excel/PPT/Word 控制器，并让持久 PowerShell 先处理 `EXIT`；只有超时才 terminate/kill。
 - 如果智能体异常中断而没执行 `stop`，bridge 会在最后一个 Action 完成后空闲 15 分钟自动退出。可在启动前用 `WPS_BRIDGE_IDLE_SECONDS` 调整，设为 `0` 表示禁用兜底回收。
 - 旧版或另一 checkout 的服务不会被自动强杀，因为它可能持有未保存文档。应先确认并保存对应 WPS 状态，再人工处理；新版外部 checkout 只有显式 `--takeover` 才允许协作式关闭。
@@ -120,8 +121,10 @@ logs/server-YYYY-MM-DD.log
 
 ## 路由和可靠性
 
-- HTTP 服务单线程执行，避免 PowerShell 单行协议交错。
+- HTTP handler 最多 16 个并发线程，因此慢连接或长 Action 不会独占 `/health`；达到上限的新连接会被关闭，不会无限创建线程。
+- 合法 Action 在读取、校验和路由后通过全局执行门严格串行进入 controller；并发 `/dispatch` 不会交错 PowerShell 单行协议。
 - 每个连接有 10 秒 I/O 超时，请求体最大 16 MiB，避免半包请求让 idle/stop 永久失效。
+- shutdown 开始后不再接纳 Action；已经执行的 Action 会完成，排队中的 Action 返回 `503 BRIDGE_SHUTTING_DOWN`，controller 在所有 handler 退出后只清理一次。
 - 每次 PowerShell 尝试使用独立 `reqId`；同一 Action 的自动重试保持相同 `traceId`。
 - stderr 会被持续排空并写入对应 Action trace，避免管道阻塞。
 - 单 Action 超过 60 秒会终止桥接进程；可恢复 COM 故障会自动重连并重试一次。
