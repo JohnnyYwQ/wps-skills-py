@@ -35,6 +35,38 @@ class _RecordingController:
         return True
 
 
+class _FakeActionGate:
+    def __init__(self, *, acquired=True, on_acquire=None):
+        self.acquired = acquired
+        self.on_acquire = on_acquire
+        self.waits = []
+        self.release_count = 0
+        self.close_count = 0
+
+    def acquire(self, timeout_seconds):
+        self.waits.append(timeout_seconds)
+        if self.on_acquire:
+            self.on_acquire()
+        return self.acquired
+
+    def release(self):
+        self.release_count += 1
+
+    def close(self):
+        self.close_count += 1
+
+
+class _FakeClock:
+    def __init__(self):
+        self.now = 0.0
+
+    def monotonic(self):
+        return self.now
+
+    def advance(self, seconds):
+        self.now += seconds
+
+
 class ActionRuntimeTests(unittest.TestCase):
     def test_execute_routes_unique_action_and_returns_action_trace(self):
         controller = _RecordingController()
@@ -211,7 +243,7 @@ class ActionRuntimeTests(unittest.TestCase):
         self.assertEqual("INVALID_PARAMS", result["code"])
         self.assertEqual([], initialized)
 
-    def test_concurrent_calls_are_serialized_and_reuse_one_ready_controller(self):
+    def test_concurrent_calls_are_serialized_and_close_each_action_controller(self):
         entered = threading.Event()
         overlap = threading.Event()
         release = threading.Event()
@@ -267,7 +299,7 @@ class ActionRuntimeTests(unittest.TestCase):
         self.assertFalse(first.is_alive())
         self.assertFalse(second.is_alive())
         self.assertEqual(2, len(responses))
-        self.assertEqual(["excel"], factory_calls)
+        self.assertEqual(["excel", "excel"], factory_calls)
 
     def test_close_is_idempotent_and_closed_runtime_rejects_new_actions(self):
         controller = _RecordingController()
@@ -432,6 +464,196 @@ class ActionRuntimeTests(unittest.TestCase):
         self.assertEqual("INVALID_ACTION_MANIFEST", result["code"])
         self.assertIn("manifest is broken", result["error"])
         self.assertIn("traceId", result)
+
+    def test_action_queue_timeout_skips_controller_initialization_and_cleans_gate(self):
+        gate = _FakeActionGate(acquired=False)
+        initialized = []
+        runtime = ActionRuntime(
+            controller_factory=lambda app, trace=None: (
+                initialized.append(app) or _RecordingController()
+            ),
+            action_gate_factory=lambda: gate,
+        )
+        try:
+            result = runtime.execute(ActionRequest(
+                action="setCellValue",
+                params={"row": 1, "col": 1, "value": 42},
+            )).to_dict()
+        finally:
+            runtime.close()
+
+        self.assertEqual("ACTION_QUEUE_TIMEOUT", result["code"])
+        self.assertEqual([600], gate.waits)
+        self.assertEqual([], initialized)
+        self.assertEqual(0, gate.release_count)
+        self.assertEqual(1, gate.close_count)
+
+    def test_execution_budget_starts_after_the_gate_is_acquired(self):
+        clock = _FakeClock()
+        gate = _FakeActionGate(on_acquire=lambda: clock.advance(600))
+        controller = _RecordingController()
+        received_deadlines = []
+
+        def controller_factory(app, trace=None, deadline=None):
+            received_deadlines.append(deadline)
+            return controller
+
+        runtime = ActionRuntime(
+            controller_factory=controller_factory,
+            action_gate_factory=lambda: gate,
+            clock=clock.monotonic,
+        )
+        try:
+            result = runtime.execute(ActionRequest(
+                action="setCellValue",
+                params={"row": 1, "col": 1, "value": 42},
+            )).to_dict()
+        finally:
+            runtime.close()
+
+        self.assertTrue(result["success"])
+        self.assertEqual([720], received_deadlines)
+        self.assertEqual(1, controller.close_count)
+        self.assertEqual(1, gate.release_count)
+        self.assertEqual(1, gate.close_count)
+
+    def test_execution_timeout_closes_controller_before_releasing_gate(self):
+        clock = _FakeClock()
+        gate = _FakeActionGate()
+        controller = _RecordingController()
+        events = []
+
+        def execute(action, params, trace=None, deadline=None):
+            events.append("execute")
+            clock.advance(121)
+            return {"success": True, "data": {}}
+
+        controller.execute = execute
+        original_close = controller.close
+
+        def close():
+            events.append("close")
+            original_close()
+
+        controller.close = close
+        original_release = gate.release
+
+        def release():
+            events.append("release")
+            original_release()
+
+        gate.release = release
+        runtime = ActionRuntime(
+            controller_factory=lambda app, trace=None, deadline=None: controller,
+            action_gate_factory=lambda: gate,
+            clock=clock.monotonic,
+        )
+        try:
+            result = runtime.execute(ActionRequest(
+                action="setCellValue",
+                params={"row": 1, "col": 1, "value": 42},
+            )).to_dict()
+        finally:
+            runtime.close()
+
+        self.assertEqual("ACTION_EXECUTION_TIMEOUT", result["code"])
+        self.assertEqual(["execute", "close", "release"], events)
+
+    def test_controller_initialization_cannot_consume_the_execution_budget(self):
+        clock = _FakeClock()
+        gate = _FakeActionGate()
+        controller = _RecordingController()
+
+        def controller_factory(app, trace=None, deadline=None):
+            clock.advance(121)
+            return controller
+
+        runtime = ActionRuntime(
+            controller_factory=controller_factory,
+            action_gate_factory=lambda: gate,
+            clock=clock.monotonic,
+        )
+        try:
+            result = runtime.execute(ActionRequest(
+                action="setCellValue",
+                params={"row": 1, "col": 1, "value": 42},
+            )).to_dict()
+        finally:
+            runtime.close()
+
+        self.assertEqual("ACTION_EXECUTION_TIMEOUT", result["code"])
+        self.assertEqual([], controller.calls)
+        self.assertEqual(1, controller.close_count)
+        self.assertEqual(1, gate.release_count)
+
+    def test_bridge_ping_stops_before_initializing_another_app_after_timeout(self):
+        clock = _FakeClock()
+        gate = _FakeActionGate()
+        initialized = []
+
+        def controller_factory(app, trace=None, deadline=None):
+            controller = _RecordingController()
+            initialized.append(app)
+            if app == "excel":
+                controller.ping = lambda trace=None: (clock.advance(121) or False)
+            return controller
+
+        runtime = ActionRuntime(
+            controller_factory=controller_factory,
+            action_gate_factory=lambda: gate,
+            clock=clock.monotonic,
+        )
+        try:
+            result = runtime.execute(ActionRequest(action="ping")).to_dict()
+        finally:
+            runtime.close()
+
+        self.assertEqual("ACTION_EXECUTION_TIMEOUT", result["code"])
+        self.assertEqual(["excel"], initialized)
+        self.assertEqual(1, gate.release_count)
+
+    def test_action_exception_releases_gate_after_controller_cleanup(self):
+        gate = _FakeActionGate()
+        controller = _RecordingController()
+        controller.execute = lambda action, params, trace=None: (_ for _ in ()).throw(
+            RuntimeError("controller disconnected")
+        )
+        runtime = ActionRuntime(
+            controller_factory=lambda app, trace=None: controller,
+            action_gate_factory=lambda: gate,
+        )
+        try:
+            result = runtime.execute(ActionRequest(
+                action="setCellValue",
+                params={"row": 1, "col": 1, "value": 42},
+            )).to_dict()
+        finally:
+            runtime.close()
+
+        self.assertFalse(result["success"])
+        self.assertEqual(1, controller.close_count)
+        self.assertEqual(1, gate.release_count)
+        self.assertEqual(1, gate.close_count)
+
+    def test_interrupt_during_cleanup_still_releases_and_closes_gate(self):
+        gate = _FakeActionGate()
+        controller = _RecordingController()
+        controller.close = lambda: (_ for _ in ()).throw(KeyboardInterrupt())
+        runtime = ActionRuntime(
+            controller_factory=lambda app, trace=None: controller,
+            action_gate_factory=lambda: gate,
+        )
+        try:
+            with self.assertRaises(KeyboardInterrupt):
+                runtime.execute(ActionRequest(
+                    action="setCellValue",
+                    params={"row": 1, "col": 1, "value": 42},
+                ))
+        finally:
+            runtime.close()
+
+        self.assertEqual(1, gate.release_count)
+        self.assertEqual(1, gate.close_count)
 
 
 if __name__ == "__main__":

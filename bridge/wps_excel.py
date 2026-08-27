@@ -22,7 +22,8 @@ import threading
 from typing import Any, Dict, Optional
 
 from powershell_contracts import render_chart_type_converter
-from service_lifecycle import stop_line_process
+from line_process import stop_line_process
+from action_timing import bounded_timeout
 from windows_com import describe_powershell_startup_failure, resolve_com_runtime
 
 # ==================== 平台检测 ====================
@@ -1023,7 +1024,7 @@ while ($true) {
 class WpsExcelController:
     """WPS Excel 控制器 - 通过 COM 自动化操作 WPS Excel"""
 
-    def __init__(self, trace=None):
+    def __init__(self, trace=None, deadline=None):
         self.platform = platform.system()
         self._ps_process = None
         self._ready = False
@@ -1039,7 +1040,7 @@ class WpsExcelController:
         self._linux_error = ""
 
         if IS_WINDOWS:
-            self._init_windows(trace=trace)
+            self._init_windows(trace=trace, deadline=deadline)
         elif IS_LINUX:
             self._init_linux(trace=trace)
         else:
@@ -1047,7 +1048,7 @@ class WpsExcelController:
 
     # ==================== Windows: PowerShell COM 桥接 ====================
 
-    def _init_windows(self, trace=None):
+    def _init_windows(self, trace=None, deadline=None):
         """初始化 Windows PowerShell COM 桥接进程"""
         started = time.perf_counter()
         try:
@@ -1095,7 +1096,10 @@ class WpsExcelController:
             self._stderr_reader.start()
 
             # 读取就绪信号（带超时保护，避免 PS 卡死导致永久阻塞）
-            ready_line = self._read_line_with_timeout(self._ps_process.stdout, 30)
+            ready_line = self._read_line_with_timeout(
+                self._ps_process.stdout,
+                bounded_timeout(30, deadline),
+            )
             ready = json.loads(ready_line) if ready_line else {}
             self._ready = ready.get('ready', False)
             if not self._ready:
@@ -1202,37 +1206,28 @@ class WpsExcelController:
             return self._id_counter
 
     def _kill_ps(self):
-        """强制终止 PowerShell 进程并清理"""
-        try:
-            if self._ps_process and self._ps_process.stdin:
-                self._ps_process.stdin.write("EXIT\n")
-                self._ps_process.stdin.flush()
-        except Exception:
-            pass
-        try:
-            if self._ps_process and self._ps_process.poll() is None:
-                self._ps_process.kill()
-        except Exception:
-            pass
-        finally:
-            self._ps_process = None
-            if self._stop is not None:
-                self._stop.set()
+        """Stop PowerShell with the bounded line-process cleanup protocol."""
+        process = self._ps_process
+        self._ps_process = None
+        if self._stop is not None:
+            self._stop.set()
+        stop_line_process(process)
 
-    def _reinit_windows(self, trace=None):
+    def _reinit_windows(self, trace=None, deadline=None):
         """销毁旧进程并重新初始化（用于 WPS 断开后的自动重连）"""
         self._kill_ps()
-        self._init_windows(trace=trace)
+        self._init_windows(trace=trace, deadline=deadline)
 
     def _is_com_failure(self, err):
         e = (err or "").lower()
         return any(h in e for h in COM_FAIL_HINTS)
 
-    def _read_result(self, req_id, trace=None, attempt=1, started=None):
+    def _read_result(self, req_id, trace=None, attempt=1, started=None, deadline=None):
         started = started or time.perf_counter()
-        deadline = time.time() + EXEC_TIMEOUT
+        timeout = bounded_timeout(EXEC_TIMEOUT, deadline)
+        response_deadline = time.monotonic() + timeout
         while True:
-            remaining = deadline - time.time()
+            remaining = response_deadline - time.monotonic()
             if remaining <= 0:
                 self._ready = False
                 self._drain_stderr(trace, attempt)
@@ -1310,7 +1305,7 @@ class WpsExcelController:
                 )
             continue
 
-    def _run_windows_attempt(self, action, params, attempt, trace=None):
+    def _run_windows_attempt(self, action, params, attempt, trace=None, deadline=None):
         req_id = self._next_id()
         command = {
             "reqId": req_id,
@@ -1349,9 +1344,15 @@ class WpsExcelController:
                 )
             self._kill_ps()
             return {"success": False, "error": f"发送命令失败: {e}"}
-        return self._read_result(req_id, trace=trace, attempt=attempt, started=started)
+        return self._read_result(
+            req_id,
+            trace=trace,
+            attempt=attempt,
+            started=started,
+            deadline=deadline,
+        )
 
-    def _exec_windows(self, action: str, params: dict, trace=None) -> dict:
+    def _exec_windows(self, action: str, params: dict, trace=None, deadline=None) -> dict:
         """通过 PowerShell COM 执行 action（同一 trace 下最多两次尝试）。"""
         if not self._ps_process or self._ps_process.poll() is not None:
             self._ready = False
@@ -1364,7 +1365,9 @@ class WpsExcelController:
                 )
             return {"success": False, "error": "PowerShell 进程已退出，请重启桥接服务"}
 
-        result = self._run_windows_attempt(action, params, attempt=1, trace=trace)
+        result = self._run_windows_attempt(
+            action, params, attempt=1, trace=trace, deadline=deadline,
+        )
         # 偶发 COM 抖动 / “未注册对象” / 覆盖弹窗取消等：重连桥接后自动重试一次
         if (not result.get("success")) and self._is_com_failure(result.get("error", "")):
             if trace:
@@ -1377,7 +1380,7 @@ class WpsExcelController:
                     reason=result.get("error"),
                 )
             try:
-                self._reinit_windows(trace=trace)
+                self._reinit_windows(trace=trace, deadline=deadline)
             except Exception as exc:
                 if trace:
                     trace.event(
@@ -1388,7 +1391,9 @@ class WpsExcelController:
                         error=f"{type(exc).__name__}: {exc}",
                     )
             if self._ps_process and self._ps_process.poll() is None:
-                result = self._run_windows_attempt(action, params, attempt=2, trace=trace)
+                result = self._run_windows_attempt(
+                    action, params, attempt=2, trace=trace, deadline=deadline,
+                )
         return result
 
     # ==================== Linux: 文件级后端（vendored openpyxl） ====================
@@ -1435,7 +1440,7 @@ class WpsExcelController:
 
     # ==================== 统一执行入口 ====================
 
-    def execute(self, action: str, params: dict = None, trace=None) -> dict:
+    def execute(self, action: str, params: dict = None, trace=None, deadline=None) -> dict:
         """统一执行入口 - 所有 action 通过此处调用"""
         if params is None:
             params = {}
@@ -1444,7 +1449,7 @@ class WpsExcelController:
         if not self._ready and action != "ping":
             try:
                 if IS_WINDOWS:
-                    self._reinit_windows(trace=trace)
+                    self._reinit_windows(trace=trace, deadline=deadline)
                 elif IS_LINUX:
                     self._init_linux(trace=trace)
             except Exception as e:
@@ -1454,16 +1459,16 @@ class WpsExcelController:
             return {"success": False, "error": "WPS Excel 未连接"}
 
         if IS_WINDOWS:
-            return self._exec_windows(action, params, trace=trace)
+            return self._exec_windows(action, params, trace=trace, deadline=deadline)
         elif IS_LINUX:
             return self._exec_linux(action, params, trace=trace)
         else:
             return {"success": False, "error": f"不支持的平台: {self.platform}"}
 
-    def ping(self, trace=None) -> bool:
+    def ping(self, trace=None, deadline=None) -> bool:
         """检测 WPS 连接状态"""
         try:
-            result = self.execute("ping", trace=trace)
+            result = self.execute("ping", trace=trace, deadline=deadline)
             return result.get("success", False)
         except Exception:
             return False
@@ -1492,11 +1497,11 @@ class WpsExcelController:
 # ==================== 单例 ====================
 _controller = None
 
-def get_controller(trace=None) -> WpsExcelController:
+def get_controller(trace=None, deadline=None) -> WpsExcelController:
     """获取单例控制器"""
     global _controller
     if _controller is None or not _controller._ready:
-        _controller = WpsExcelController(trace=trace)
+        _controller = WpsExcelController(trace=trace, deadline=deadline)
     return _controller
 
 

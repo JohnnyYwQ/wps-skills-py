@@ -25,7 +25,8 @@ import threading
 from typing import Any, Dict, Optional
 
 from powershell_contracts import render_chart_type_converter
-from service_lifecycle import stop_line_process
+from line_process import stop_line_process
+from action_timing import bounded_timeout
 from windows_com import describe_powershell_startup_failure, resolve_com_runtime
 
 # ==================== 平台检测 ====================
@@ -1172,7 +1173,7 @@ while ($true) {
 class WpsPptController:
     """WPS 演示控制器：通过持久 PowerShell 子进程调用 WPS COM（Kwpp.Application）"""
 
-    def __init__(self, trace=None):
+    def __init__(self, trace=None, deadline=None):
         self.platform = platform.system()
         self._ps_process = None
         self._ready = False
@@ -1187,13 +1188,13 @@ class WpsPptController:
         self._linux_error = ""
 
         if IS_WINDOWS:
-            self._init_windows(trace=trace)
+            self._init_windows(trace=trace, deadline=deadline)
         elif IS_LINUX:
             self._init_linux(trace=trace)
         else:
             raise RuntimeError(f"不支持的平台: {self.platform}")
 
-    def _init_windows(self, trace=None):
+    def _init_windows(self, trace=None, deadline=None):
         started = time.perf_counter()
         try:
             com_runtime = resolve_com_runtime(PPT_PROGID)
@@ -1229,7 +1230,10 @@ class WpsPptController:
             self._stderr_reader = threading.Thread(target=self._stderr_loop, daemon=True)
             self._stderr_reader.start()
 
-            ready_line = self._read_line_with_timeout(self._ps_process.stdout, 30)
+            ready_line = self._read_line_with_timeout(
+                self._ps_process.stdout,
+                bounded_timeout(30, deadline),
+            )
             ready = json.loads(ready_line) if ready_line else {}
             self._ready = ready.get('ready', False)
             if not self._ready:
@@ -1318,31 +1322,25 @@ class WpsPptController:
             return self._id_counter
 
     def _kill_ps(self):
-        try:
-            if self._ps_process and self._ps_process.stdin:
-                self._ps_process.stdin.write("EXIT\n"); self._ps_process.stdin.flush()
-        except Exception: pass
-        try:
-            if self._ps_process and self._ps_process.poll() is None:
-                self._ps_process.kill()
-        except Exception: pass
-        finally:
-            self._ps_process = None
-            if self._stop is not None: self._stop.set()
+        process = self._ps_process
+        self._ps_process = None
+        if self._stop is not None: self._stop.set()
+        stop_line_process(process)
 
-    def _reinit_windows(self, trace=None):
+    def _reinit_windows(self, trace=None, deadline=None):
         self._kill_ps()
-        self._init_windows(trace=trace)
+        self._init_windows(trace=trace, deadline=deadline)
 
     def _is_com_failure(self, err):
         e = (err or "").lower()
         return any(h in e for h in COM_FAIL_HINTS)
 
-    def _read_result(self, req_id, trace=None, attempt=1, started=None):
+    def _read_result(self, req_id, trace=None, attempt=1, started=None, deadline=None):
         started = started or time.perf_counter()
-        deadline = time.time() + EXEC_TIMEOUT
+        timeout = bounded_timeout(EXEC_TIMEOUT, deadline)
+        response_deadline = time.monotonic() + timeout
         while True:
-            remaining = deadline - time.time()
+            remaining = response_deadline - time.monotonic()
             if remaining <= 0:
                 self._ready = False; self._kill_ps()
                 self._drain_stderr(trace, attempt)
@@ -1399,7 +1397,7 @@ class WpsPptController:
                 )
             continue
 
-    def _run_windows_attempt(self, action, params, attempt, trace=None):
+    def _run_windows_attempt(self, action, params, attempt, trace=None, deadline=None):
         req_id = self._next_id()
         cmd = json.dumps({
             "reqId": req_id,
@@ -1430,16 +1428,20 @@ class WpsPptController:
                 )
             self._kill_ps()
             return {"success": False, "error": f"发送命令失败: {e}"}
-        return self._read_result(req_id, trace=trace, attempt=attempt, started=started)
+        return self._read_result(
+            req_id, trace=trace, attempt=attempt, started=started, deadline=deadline,
+        )
 
-    def _exec_windows(self, action, params, trace=None):
+    def _exec_windows(self, action, params, trace=None, deadline=None):
         if not self._ps_process or self._ps_process.poll() is not None:
             self._ready = False
             if trace:
                 trace.event("powershell.process.unavailable", status="error", app="ppt", action=action)
             return {"success": False, "error": "PowerShell 进程已退出，请重启桥接服务"}
 
-        result = self._run_windows_attempt(action, params, attempt=1, trace=trace)
+        result = self._run_windows_attempt(
+            action, params, attempt=1, trace=trace, deadline=deadline,
+        )
         # 偶发 COM 抖动 / “未注册对象” / 覆盖弹窗取消等：重连桥接后自动重试一次，
         # 解决“异常后无法重置状态、只能手工重启服务”的卡死问题
         if (not result.get("success")) and self._is_com_failure(result.get("error", "")):
@@ -1449,7 +1451,7 @@ class WpsPptController:
                     action=action, nextAttempt=2, reason=result.get("error"),
                 )
             try:
-                self._reinit_windows(trace=trace)
+                self._reinit_windows(trace=trace, deadline=deadline)
             except Exception as exc:
                 if trace:
                     trace.event(
@@ -1457,7 +1459,9 @@ class WpsPptController:
                         action=action, error=f"{type(exc).__name__}: {exc}",
                     )
             if self._ps_process and self._ps_process.poll() is None:
-                result = self._run_windows_attempt(action, params, attempt=2, trace=trace)
+                result = self._run_windows_attempt(
+                    action, params, attempt=2, trace=trace, deadline=deadline,
+                )
         return result
 
     # ==================== Linux: 文件级后端（纯 stdlib OpenXML） ====================
@@ -1499,23 +1503,23 @@ class WpsPptController:
         except Exception as e:
             return {"success": False, "error": f"Linux 后端执行异常: {e}"}
 
-    def execute(self, action, params=None, trace=None):
+    def execute(self, action, params=None, trace=None, deadline=None):
         if params is None: params = {}
         if not self._ready and action != "ping":
             try:
-                if IS_WINDOWS: self._reinit_windows(trace=trace)
+                if IS_WINDOWS: self._reinit_windows(trace=trace, deadline=deadline)
                 elif IS_LINUX: self._init_linux(trace=trace)
             except Exception as e:
                 return {"success": False, "error": f"WPS 演示未连接，且重连失败: {e}"}
         if not self._ready and action != "ping":
             return {"success": False, "error": "WPS 演示未连接"}
 
-        if IS_WINDOWS: return self._exec_windows(action, params, trace=trace)
+        if IS_WINDOWS: return self._exec_windows(action, params, trace=trace, deadline=deadline)
         elif IS_LINUX: return self._exec_linux(action, params, trace=trace)
         return {"success": False, "error": f"不支持的平台: {self.platform}"}
 
-    def ping(self, trace=None):
-        try: return self.execute("ping", trace=trace).get("success", False)
+    def ping(self, trace=None, deadline=None):
+        try: return self.execute("ping", trace=trace, deadline=deadline).get("success", False)
         except Exception: return False
 
     def close(self):
@@ -1535,10 +1539,10 @@ class WpsPptController:
 
 _controller = None
 
-def get_controller(trace=None) -> WpsPptController:
+def get_controller(trace=None, deadline=None) -> WpsPptController:
     global _controller
     if _controller is None or not _controller._ready:
-        _controller = WpsPptController(trace=trace)
+        _controller = WpsPptController(trace=trace, deadline=deadline)
     return _controller
 
 
