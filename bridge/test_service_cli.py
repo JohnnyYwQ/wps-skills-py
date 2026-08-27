@@ -9,10 +9,25 @@ SCRIPTS_DIR = Path(__file__).resolve().parents[1] / "scripts"
 sys.path.insert(0, str(SCRIPTS_DIR))
 import service
 
-from service_lifecycle import build_service_identity, current_service_identity
+from service_lifecycle import (
+    ServiceStartResult,
+    build_service_identity,
+    current_service_identity,
+)
 
 
 class ServiceCliTests(unittest.TestCase):
+    def test_start_exposes_bridge_discovery_disposition(self):
+        ready = ServiceStartResult(
+            True,
+            health={"instanceId": "instance-a"},
+            disposition="reused",
+        )
+        with patch.object(service.call, "_ensure_server", return_value=ready):
+            result = service.start()
+
+        self.assertEqual("reused", result["disposition"])
+
     def test_windows_wait_failures_are_conservatively_treated_as_running(self):
         self.assertFalse(service._windows_wait_result_is_running(0x00000000))
         self.assertTrue(service._windows_wait_result_is_running(0x00000102))

@@ -8,6 +8,7 @@ import tempfile
 import io
 import urllib.error
 import urllib.request
+from contextlib import nullcontext
 from unittest.mock import MagicMock
 from types import SimpleNamespace
 
@@ -236,6 +237,15 @@ class CallArgumentTests(unittest.TestCase):
 
 
 class CallServiceLifecycleRegressionTests(unittest.TestCase):
+    def setUp(self):
+        listener_patcher = patch.object(
+            call,
+            "_listener_identity",
+            return_value={"pid": None, "createdAt": None},
+        )
+        listener_patcher.start()
+        self.addCleanup(listener_patcher.stop)
+
     def test_loopback_opener_does_not_inherit_environment_proxy(self):
         proxy_handlers = [
             handler
@@ -280,6 +290,220 @@ class CallServiceLifecycleRegressionTests(unittest.TestCase):
         self.assertFalse(result)
         self.assertEqual("BRIDGE_UNAVAILABLE", result.code)
         popen.assert_not_called()
+
+    def test_health_timeout_reports_listener_identity_before_and_after_probe(self):
+        probe = call.HealthProbe("unresponsive", error="timed out")
+        listener_before = {"pid": 111, "createdAt": "before-time"}
+        listener_after = {"pid": 111, "createdAt": "before-time"}
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(
+            os.environ,
+            {"WPS_TRACE_DIR": tmp},
+            clear=False,
+        ):
+            trace = ActionTrace.start(component="test")
+            with patch.object(call, "_health", return_value=probe), patch.object(
+                call,
+                "_listener_identity",
+                side_effect=[listener_before, listener_after],
+                create=True,
+            ), patch.object(call.subprocess, "Popen") as popen:
+                result = call._ensure_server(trace=trace)
+
+            events = [
+                json.loads(line)
+                for line in trace.log_path.read_text(encoding="utf-8").splitlines()
+            ]
+
+        unavailable = next(
+            row for row in events if row["event"] == "bridge.health.unavailable"
+        )
+        self.assertFalse(result)
+        self.assertEqual("unknown_owner", result.disposition)
+        self.assertEqual(listener_before, result.listener_before)
+        self.assertEqual(listener_after, result.listener_after)
+        self.assertEqual(listener_before, unavailable["listenerBefore"])
+        self.assertEqual(listener_after, unavailable["listenerAfter"])
+        popen.assert_not_called()
+
+    def test_listener_without_confirmed_health_is_unknown_and_never_replaced(self):
+        listener = {"pid": 222, "createdAt": "listener-start"}
+        with patch.object(
+            call,
+            "_health",
+            return_value=call.HealthProbe("absent", error="connection refused"),
+        ), patch.object(
+            call,
+            "_listener_identity",
+            return_value=listener,
+        ), patch.object(call.subprocess, "Popen") as popen:
+            result = call._ensure_server()
+
+        self.assertFalse(result)
+        self.assertEqual("unknown_owner", result.disposition)
+        self.assertEqual(listener, result.listener_before)
+        self.assertEqual(listener, result.listener_after)
+        popen.assert_not_called()
+
+    def test_current_checkout_health_without_launch_identity_is_unknown(self):
+        incomplete = {
+            "status": "ok",
+            **current_service_identity(instance_id="incomplete-instance"),
+        }
+        with patch.object(call, "_health", return_value=incomplete), patch.object(
+            call.subprocess,
+            "Popen",
+        ) as popen:
+            result = call._ensure_server()
+
+        self.assertFalse(result)
+        self.assertEqual("unknown_owner", result.disposition)
+        popen.assert_not_called()
+
+    def test_start_winner_reprobes_inside_lock_and_reuses_ready_bridge(self):
+        ready_health = {
+            "status": "ok",
+            **current_service_identity(instance_id="winner-instance"),
+            "launchId": "winner-launch",
+            "launchedByPid": 123,
+            "serverPath": call._server_path(),
+            "launchStartedAt": "2026-08-27T01:02:03.004Z",
+            "pid": 124,
+            "serverPid": 124,
+        }
+        with patch.object(
+            call,
+            "_health",
+            side_effect=[None, ready_health],
+        ), patch.object(
+            call,
+            "_startup_lock",
+            return_value=nullcontext(),
+            create=True,
+        ), patch.object(call.subprocess, "Popen") as popen:
+            result = call._ensure_server()
+
+        self.assertTrue(result)
+        self.assertFalse(result.started)
+        self.assertEqual("reused", result.disposition)
+        self.assertEqual("winner-instance", result.health["instanceId"])
+        popen.assert_not_called()
+
+    def test_self_started_requires_health_to_match_launch_and_child_pid(self):
+        process = MagicMock()
+        process.pid = 456
+        process.poll.return_value = None
+        ready_health = {
+            "status": "ok",
+            **current_service_identity(instance_id="new-instance"),
+            "launchId": "launch-a",
+            "pid": 456,
+            "serverPid": 456,
+            "launchedByPid": os.getpid(),
+            "serverPath": call._server_path(),
+            "launchStartedAt": "2026-08-27T01:02:03.004Z",
+        }
+        with patch.object(
+            call,
+            "_health",
+            side_effect=[None, None, ready_health],
+        ), patch.object(call.os.path, "exists", return_value=True), patch.object(
+            call,
+            "server_log_path",
+            return_value=(None, None),
+        ), patch.object(
+            call.subprocess,
+            "Popen",
+            return_value=process,
+        ) as popen, patch.object(
+            call.uuid,
+            "uuid4",
+            return_value=SimpleNamespace(hex="launch-a"),
+            create=True,
+        ), patch.object(
+            call,
+            "_utc_timestamp",
+            return_value="2026-08-27T01:02:03.004Z",
+        ), patch.object(call.time, "sleep"):
+            result = call._ensure_server()
+
+        self.assertTrue(result)
+        self.assertTrue(result.started)
+        self.assertEqual("self_started", result.disposition)
+        launch_environment = popen.call_args.kwargs["env"]
+        self.assertEqual("launch-a", launch_environment["WPS_BRIDGE_LAUNCH_ID"])
+        self.assertEqual(str(os.getpid()), launch_environment["WPS_BRIDGE_LAUNCHED_BY_PID"])
+        self.assertEqual("456", str(result.health["serverPid"]))
+
+    def test_spawn_response_with_incomplete_launch_identity_is_unknown(self):
+        process = MagicMock()
+        process.pid = 456
+        process.poll.return_value = None
+        incomplete_health = {
+            "status": "ok",
+            **current_service_identity(instance_id="new-instance"),
+            "launchId": "launch-a",
+            "pid": 456,
+            "serverPid": 456,
+        }
+        with patch.object(
+            call,
+            "_health",
+            side_effect=[None, None, incomplete_health],
+        ), patch.object(call.os.path, "exists", return_value=True), patch.object(
+            call,
+            "server_log_path",
+            return_value=(None, None),
+        ), patch.object(
+            call.subprocess,
+            "Popen",
+            return_value=process,
+        ), patch.object(
+            call.uuid,
+            "uuid4",
+            return_value=SimpleNamespace(hex="launch-a"),
+        ), patch.object(call.time, "sleep"):
+            result = call._ensure_server()
+
+        self.assertFalse(result)
+        self.assertEqual("unknown_owner", result.disposition)
+        process.terminate.assert_called_once_with()
+
+    def test_spawn_response_cannot_reuse_mismatched_launch_on_child_pid(self):
+        process = MagicMock()
+        process.pid = 456
+        process.poll.return_value = None
+        mismatched_health = {
+            "status": "ok",
+            **current_service_identity(instance_id="unexpected-instance"),
+            "launchId": "other-launch",
+            "pid": 456,
+            "serverPid": 456,
+            "launchedByPid": 999,
+            "serverPath": call._server_path(),
+            "launchStartedAt": "2026-08-27T00:00:00.000Z",
+        }
+        with patch.object(
+            call,
+            "_health",
+            side_effect=[None, None, mismatched_health],
+        ), patch.object(call.os.path, "exists", return_value=True), patch.object(
+            call,
+            "server_log_path",
+            return_value=(None, None),
+        ), patch.object(
+            call.subprocess,
+            "Popen",
+            return_value=process,
+        ), patch.object(
+            call.uuid,
+            "uuid4",
+            return_value=SimpleNamespace(hex="launch-a"),
+        ), patch.object(call.time, "sleep"):
+            result = call._ensure_server()
+
+        self.assertFalse(result)
+        self.assertEqual("unknown_owner", result.disposition)
+        process.terminate.assert_called_once_with()
 
     def test_non_object_health_is_rejected_without_trace_crash(self):
         with tempfile.TemporaryDirectory() as tmp, patch.dict(
@@ -368,14 +592,22 @@ class CallServiceLifecycleRegressionTests(unittest.TestCase):
         ready_health = {
             "status": "ok",
             **current_service_identity(instance_id="new-instance"),
+            "launchId": "windows-launch",
+            "pid": 789,
+            "serverPid": 789,
+            "launchedByPid": os.getpid(),
+            "serverPath": call._server_path(),
+            "launchStartedAt": "2026-08-27T01:02:03.004Z",
         }
         process = MagicMock()
+        process.pid = 789
+        process.poll.return_value = None
 
         class _StartupInfo:
             def __init__(self):
                 self.dwFlags = 0
 
-        with patch.object(call, "_health", side_effect=[None, ready_health]), patch.object(
+        with patch.object(call, "_health", side_effect=[None, None, ready_health]), patch.object(
             call,
             "current_service_identity",
             return_value=expected,
@@ -410,7 +642,15 @@ class CallServiceLifecycleRegressionTests(unittest.TestCase):
             call.subprocess,
             "Popen",
             return_value=process,
-        ) as popen, patch.object(call.time, "sleep"):
+        ) as popen, patch.object(
+            call.uuid,
+            "uuid4",
+            return_value=SimpleNamespace(hex="windows-launch"),
+        ), patch.object(
+            call,
+            "_utc_timestamp",
+            return_value="2026-08-27T01:02:03.004Z",
+        ), patch.object(call.time, "sleep"):
             result = call._ensure_server()
 
         self.assertTrue(result)

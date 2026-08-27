@@ -177,7 +177,23 @@ def current_service_identity(instance_id: Optional[str] = None) -> dict:
 
 
 def new_service_identity() -> dict:
-    return current_service_identity(instance_id=uuid.uuid4().hex)
+    identity = current_service_identity(instance_id=uuid.uuid4().hex)
+    launched_by_pid = os.environ.get("WPS_BRIDGE_LAUNCHED_BY_PID", "").strip()
+    try:
+        launched_by_pid_value = int(launched_by_pid)
+    except (TypeError, ValueError):
+        launched_by_pid_value = os.getppid()
+    identity.update(
+        {
+            "launchId": os.environ.get("WPS_BRIDGE_LAUNCH_ID") or uuid.uuid4().hex,
+            "launchedByPid": launched_by_pid_value,
+            "serverPath": os.environ.get("WPS_BRIDGE_SERVER_PATH")
+            or str(project_root() / "bridge" / "server.py"),
+            "launchStartedAt": os.environ.get("WPS_BRIDGE_LAUNCH_STARTED_AT")
+            or _utc_timestamp(),
+        }
+    )
+    return identity
 
 
 @dataclass(frozen=True)
@@ -254,6 +270,9 @@ class ServiceStartResult:
     error: Optional[str] = None
     health: Optional[dict] = None
     started: bool = False
+    disposition: Optional[str] = None
+    listener_before: Optional[dict] = None
+    listener_after: Optional[dict] = None
 
     def __bool__(self) -> bool:
         return self.ok
@@ -317,10 +336,12 @@ class BridgeLifecycle:
         return False
 
     def health_snapshot(self) -> dict:
+        server_pid = os.getpid()
         snapshot = {
             "status": "ok",
             **self.identity,
-            "pid": os.getpid(),
+            "pid": server_pid,
+            "serverPid": server_pid,
             "startedAt": self._started_at,
             "uptimeSeconds": round(max(0.0, self._clock() - self._started_monotonic), 3),
             "idleForSeconds": round(self.idle_for_seconds(), 3),

@@ -1,14 +1,16 @@
 import tempfile
 import subprocess
 import unittest
+import os
 from pathlib import Path
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 from service_lifecycle import (
     BridgeLifecycle,
     build_service_identity,
     code_fingerprint,
     inspect_health,
+    new_service_identity,
     stop_line_process,
 )
 
@@ -117,6 +119,28 @@ class ServiceIdentityTests(unittest.TestCase):
             after = code_fingerprint(root)
 
         self.assertNotEqual(before, after)
+
+    def test_server_identity_carries_caller_launch_context(self):
+        launch_context = {
+            "WPS_BRIDGE_LAUNCH_ID": "launch-a",
+            "WPS_BRIDGE_LAUNCHED_BY_PID": "321",
+            "WPS_BRIDGE_SERVER_PATH": "/workspace/current/bridge/server.py",
+            "WPS_BRIDGE_LAUNCH_STARTED_AT": "2026-08-27T01:02:03.004Z",
+        }
+
+        with patch.dict(os.environ, launch_context, clear=False):
+            identity = new_service_identity()
+
+        self.assertEqual("launch-a", identity["launchId"])
+        self.assertEqual(321, identity["launchedByPid"])
+        self.assertEqual(
+            "/workspace/current/bridge/server.py",
+            identity["serverPath"],
+        )
+        self.assertEqual(
+            "2026-08-27T01:02:03.004Z",
+            identity["launchStartedAt"],
+        )
 
 
 class BridgeLifecycleTests(unittest.TestCase):

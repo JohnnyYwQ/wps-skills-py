@@ -292,6 +292,9 @@ def start():
         "error": ready.error,
         "service": ready.health,
         "started": ready.started,
+        "disposition": ready.disposition,
+        "listenerBefore": ready.listener_before,
+        "listenerAfter": ready.listener_after,
     }
 
 
