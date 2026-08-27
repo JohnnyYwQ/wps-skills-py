@@ -103,6 +103,46 @@ function Convert-HexToOle($hex) {
     } catch { return $null }
 }
 
+function Convert-ChartType($value) {
+    if ($value -is [string]) {
+        switch ($value.ToLowerInvariant()) {
+            "column" { return 51 }
+            "bar" { return 57 }
+            "line" { return 4 }
+            "pie" { return 5 }
+            "doughnut" { return -4120 }
+            "area" { return 1 }
+            "scatter" { return -4169 }
+            default { throw "未知 chartType: $value" }
+        }
+    }
+    return [int]$value
+}
+
+function Convert-Distribution($value) {
+    if ($value -is [string]) {
+        switch ($value.ToLowerInvariant()) {
+            "horizontal" { return 0 }
+            "vertical" { return 1 }
+            default { throw "未知 distribute: $value" }
+        }
+    }
+    return [int]$value
+}
+
+function Convert-ZOrder($value) {
+    if ($value -is [string]) {
+        switch ($value.ToLowerInvariant()) {
+            "front" { return 0 }
+            "back" { return 1 }
+            "forward" { return 2 }
+            "backward" { return 3 }
+            default { throw "未知 order: $value" }
+        }
+    }
+    return [int]$value
+}
+
 function Get-ActivePres { if ($global:ppt.ActivePresentation) { return $global:ppt.ActivePresentation }; return $null }
 function Get-PresByName($name) {
     foreach ($p in $global:ppt.Presentations) { if ($p.Name -eq $name) { return $p } }
@@ -600,7 +640,7 @@ function Exec-distributeShapes($p) {
     $pres = Get-ActivePres
     $slide = Get-Slide $pres ([int]$p.slideIndex)
     if (-not $slide) { return @{success=$false; error="未找到幻灯片"} }
-    try { $slide.Shapes.Distribute([int]($p.distribute), 0) | Out-Null; return @{success=$true} } catch { return @{success=$false; error=$_.Exception.Message} }
+    try { $slide.Shapes.Distribute((Convert-Distribution $p.distribute), 0) | Out-Null; return @{success=$true} } catch { return @{success=$false; error=$_.Exception.Message} }
 }
 
 function Exec-groupShapes($p) {
@@ -621,14 +661,14 @@ function Exec-setShapeZOrder($p) {
     $pres = Get-ActivePres
     $slide = Get-Slide $pres ([int]$p.slideIndex)
     if (-not $slide) { return @{success=$false; error="未找到幻灯片"} }
-    try { (Get-ShapeById $slide ([int]$p.shapeIndex)).ZOrder([int]$p.order) | Out-Null; return @{success=$true} } catch { return @{success=$false; error=$_.Exception.Message} }
+    try { (Get-ShapeById $slide ([int]$p.shapeIndex)).ZOrder((Convert-ZOrder $p.order)) | Out-Null; return @{success=$true} } catch { return @{success=$false; error=$_.Exception.Message} }
 }
 
 function Exec-smartDistribute($p) {
     $pres = Get-ActivePres
     $slide = Get-Slide $pres ([int]$p.slideIndex)
     if (-not $slide) { return @{success=$false; error="未找到幻灯片"} }
-    try { $slide.Shapes.Distribute([int]($p.distribute), 0) | Out-Null; return @{success=$true} } catch { return @{success=$false; error=$_.Exception.Message} }
+    try { $slide.Shapes.Distribute((Convert-Distribution $p.distribute), 0) | Out-Null; return @{success=$true} } catch { return @{success=$false; error=$_.Exception.Message} }
 }
 
 # ---------- 图片 ----------
@@ -880,7 +920,7 @@ function Exec-insertPptChart($p) {
     try {
         $left = if ($p.x) { [int]$p.x } else { 100 }
         $top = if ($p.y) { [int]$p.y } else { 100 }
-        $chartType = if ($p.chartType) { [int]$p.chartType } else { 1 }
+        $chartType = if ($p.chartType) { Convert-ChartType $p.chartType } else { 51 }
         $sp = $slide.Shapes.AddChart($chartType, $left, $top)
         return @{success=$true; data=@{shapeId=$sp.Id}}
     } catch { return @{success=$false; error=$_.Exception.Message} }

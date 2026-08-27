@@ -10,7 +10,8 @@ WPS Skills 让智能体通过本地 Python 桥接操控 WPS Excel、PPT 和 Word
 智能体 / 用户
   → python scripts/call.py <action> ...
   → HTTP 127.0.0.1:58891/dispatch
-  → bridge/server.py 路由到 Excel / PPT / Word 控制器
+  → action_manifest.json 路由并校验参数
+  → bridge/server.py 调用 Excel / PPT / Word 控制器并校验结果
   → Windows: 持久 PowerShell line-RPC → WPS COM
     Linux: 进程内 openpyxl / OpenXML 文件后端
 ```
@@ -38,8 +39,9 @@ python scripts/install.py --check
 直接调用 Action；`call.py` 会自动启动本地桥接服务，并且只复用当前 checkout、当前运行时代码完全匹配的实例：
 
 ```bash
-# Excel
-python scripts/call.py setCellValue '{"cell":"A1","value":42}'
+# 先读取目标 Contract，再调用
+python scripts/actions.py describe setCellValue --app excel
+python scripts/call.py setCellValue '{"row":1,"col":1,"value":42}'
 
 # PPT
 python scripts/call.py createPresentation '{}'
@@ -64,6 +66,20 @@ python scripts/call.py insertImage --app ppt --params-file image.json
 ```
 
 缺少 `--app` 会返回 `AMBIGUOUS_ACTION` 和候选应用，不会猜测并操作错误的软件。
+
+## Action Contract Catalog
+
+Windows v1 Action 的名称、路由、参数 Schema、结果 Schema、前置条件和风险全部来自 `bridge/action_manifest.json`。编排者应先搜索并读取 Contract，再构造 `call.py` 参数；不要从 README 或 `SKILL.md` 猜测字段。
+
+```bash
+python scripts/actions.py list
+python scripts/actions.py list --app ppt
+python scripts/actions.py search chart
+python scripts/actions.py describe addSlide --app ppt
+python scripts/validate_action_manifest.py
+```
+
+运行中的 bridge 也提供 `GET /actions` 摘要和 `GET /actions/{owner}/{action}` 完整 Contract。查询只读取 manifest，不会初始化 WPS/COM。v1 严格契约以 Windows COM 行为为基线；Linux 后端后续对齐，不参与 v1 Schema 设计。
 
 ## 服务生命周期
 
@@ -137,6 +153,8 @@ logs/server-YYYY-MM-DD.log
 ```bash
 PYTHONPATH=bridge python -m unittest \
   bridge/test_action_trace.py \
+  bridge/test_action_manifest.py \
+  bridge/test_action_catalog.py \
   bridge/test_windows_com.py \
   bridge/test_install_check.py \
   bridge/test_server_routing.py \
@@ -155,7 +173,7 @@ python scripts/test_functional.py
 
 ## 重要文档
 
-- [SKILL.md](SKILL.md)：智能体调用约定与 Action 清单
+- [SKILL.md](SKILL.md)：智能体调用工作流、边界与高风险注意事项
 - [understand.md](understand.md)：端到端执行链、任务边界和排障说明
 - [CONTEXT.md](CONTEXT.md)：项目统一术语
 - [docs/adr/0001-explicit-app-for-ambiguous-actions.md](docs/adr/0001-explicit-app-for-ambiguous-actions.md)：重名 Action 路由决策

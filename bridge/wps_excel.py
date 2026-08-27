@@ -106,6 +106,22 @@ function ConvertToA1($col) {
     return $s
 }
 
+function Convert-ChartType($value) {
+    if ($value -is [string]) {
+        switch ($value.ToLowerInvariant()) {
+            "column" { return 51 }
+            "bar" { return 57 }
+            "line" { return 4 }
+            "pie" { return 5 }
+            "doughnut" { return -4120 }
+            "area" { return 1 }
+            "scatter" { return -4169 }
+            default { throw "未知 chartType: $value" }
+        }
+    }
+    return [int]$value
+}
+
 function Exec-getOpenWorkbooks($p) {
     $names = @()
     foreach ($wb in $global:excel.Workbooks) { $names += $wb.Name }
@@ -518,7 +534,7 @@ function Exec-createChart($p) {
     $wb = $global:excel.ActiveWorkbook
     $sheet = if ($p.sheet) { $wb.Sheets.Item($p.sheet) } else { $wb.ActiveSheet }
     $dataRange = $sheet.Range($p.dataRange)
-    $chartType = $p.chartType
+    $chartType = Convert-ChartType $p.chartType
     $left = if ($p.position.left) { $p.position.left } else { 100 }
     $top = if ($p.position.top) { $p.position.top } else { 100 }
     $width = if ($p.position.width) { $p.position.width } else { 480 }
@@ -529,7 +545,8 @@ function Exec-createChart($p) {
     if ($p.title) { $chartObj.Chart.HasTitle = $true; $chartObj.Chart.ChartTitle.Text = $p.title }
     if ($p.showLegend -ne $false) { $chartObj.Chart.HasLegend = $true }
     if ($p.showDataLabels) { $chartObj.Chart.HasAxis = $true }
-    return @{success=$true; data=@{chartName=$chartObj.Name; chartIndex=1; dataRange=$p.dataRange; chartType=$p.chartTypeName; position=@{left=$left; top=$top; width=$width; height=$height}}}
+    $chartTypeName = if ($p.chartTypeName) { $p.chartTypeName } else { [string]$p.chartType }
+    return @{success=$true; data=@{chartName=$chartObj.Name; chartIndex=1; dataRange=$p.dataRange; chartType=$chartTypeName; position=@{left=$left; top=$top; width=$width; height=$height}}}
 }
 
 function Exec-updateChart($p) {
@@ -539,7 +556,7 @@ function Exec-updateChart($p) {
     else { $chartObj = $sheet.ChartObjects().Item($p.chartIndex) }
     $updated = @()
     if ($p.title) { $chartObj.Chart.HasTitle=$true; $chartObj.Chart.ChartTitle.Text=$p.title; $updated += "title" }
-    if ($null -ne $p.chartType) { $chartObj.Chart.ChartType=$p.chartType; $updated += "chartType" }
+    if ($null -ne $p.chartType) { $chartObj.Chart.ChartType=(Convert-ChartType $p.chartType); $updated += "chartType" }
     if ($null -ne $p.showLegend) { $chartObj.Chart.HasLegend=$p.showLegend; $updated += "showLegend" }
     if ($p.dataRange) { $chartObj.Chart.SetSourceData($sheet.Range($p.dataRange)); $updated += "dataRange" }
     return @{success=$true; data=@{chartName=$chartObj.Name; updatedProperties=$updated}}

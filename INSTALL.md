@@ -58,6 +58,13 @@ python scripts/call.py addSlide --params-file C:\tmp\slide.json
 python scripts/call.py findReplace --app word --params-file C:\tmp\replace.json
 ```
 
+调用前先查询 Windows Action Contract；查询不会启动 bridge 或 WPS：
+
+```bash
+python scripts/actions.py search replace
+python scripts/actions.py describe findReplace --app word
+```
+
 如需前台观察服务，也可以单独运行：
 
 ```bash
@@ -137,6 +144,8 @@ python scripts/call.py getAppInfo --app ppt '{}'
 ```bash
 PYTHONPATH=bridge python -m unittest \
   bridge/test_action_trace.py \
+  bridge/test_action_manifest.py \
+  bridge/test_action_catalog.py \
   bridge/test_server_routing.py \
   bridge/test_controller_trace.py \
   bridge/test_service_lifecycle.py \

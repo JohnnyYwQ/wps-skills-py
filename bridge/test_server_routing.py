@@ -32,22 +32,36 @@ class _RecordingController:
         self.app = app
 
     def execute(self, action, params, trace=None):
+        self.action = action
+        self.params = params
+        if (self.app, action) == ("ppt", "saveAs"):
+            return {
+                "success": True,
+                "data": {"path": params["filePath"], "size": 1},
+            }
+        valid_data = {
+            ("word", "findReplace"): {"done": True},
+            ("word", "insertImage"): {"width": 100, "height": 100},
+            ("excel", "setCellValue"): {},
+        }
         return {
             "success": True,
-            "data": {
-                "routedApp": self.app,
-                "action": action,
-                "params": params,
-            },
+            "data": valid_data[(self.app, action)],
         }
 
 
 class ActionRoutingTests(unittest.TestCase):
     def _dispatch(self, action, params=None, app=None):
+        self.recording_controller = None
+
+        def controller_for(selected, trace=None):
+            self.recording_controller = _RecordingController(selected)
+            return self.recording_controller
+
         with patch.object(
             server,
             "get_app_controller",
-            side_effect=lambda selected, trace=None: _RecordingController(selected),
+            side_effect=controller_for,
         ):
             if app is None:
                 return server.dispatch(action, params or {})
@@ -61,7 +75,7 @@ class ActionRoutingTests(unittest.TestCase):
         )
 
         self.assertTrue(result["success"])
-        self.assertEqual("word", result["data"]["routedApp"])
+        self.assertEqual("word", self.recording_controller.app)
 
     def test_params_app_is_supported_but_not_forwarded_to_controller(self):
         result = self._dispatch(
@@ -70,8 +84,8 @@ class ActionRoutingTests(unittest.TestCase):
         )
 
         self.assertTrue(result["success"])
-        self.assertEqual("word", result["data"]["routedApp"])
-        self.assertNotIn("app", result["data"]["params"])
+        self.assertEqual("word", self.recording_controller.app)
+        self.assertNotIn("app", self.recording_controller.params)
 
     def test_ambiguous_action_without_app_fails_instead_of_guessing(self):
         result = self._dispatch("findReplace", {"find": "old", "replace": "new"})
@@ -81,10 +95,20 @@ class ActionRoutingTests(unittest.TestCase):
         self.assertEqual(["excel", "word"], result["supportedApps"])
 
     def test_unique_action_keeps_automatic_routing(self):
-        result = self._dispatch("setCellValue", {"cell": "A1", "value": 1})
+        result = self._dispatch(
+            "setCellValue", {"row": 1, "col": 1, "value": 1}
+        )
 
         self.assertTrue(result["success"])
-        self.assertEqual("excel", result["data"]["routedApp"])
+        self.assertEqual("excel", self.recording_controller.app)
+
+    def test_common_action_keeps_file_extension_routing(self):
+        result = self._dispatch(
+            "saveAs", {"filePath": "C:/tmp/report.pptx"}
+        )
+
+        self.assertTrue(result["success"])
+        self.assertEqual("ppt", self.recording_controller.app)
 
     def test_explicit_wrong_app_is_rejected_before_controller(self):
         result = self._dispatch("setCellValue", {"cell": "A1"}, app="word")
@@ -93,15 +117,60 @@ class ActionRoutingTests(unittest.TestCase):
         self.assertEqual("ACTION_NOT_SUPPORTED_FOR_APP", result["code"])
         self.assertEqual(["excel"], result["supportedApps"])
 
-    def test_server_actions_are_listed_once_as_common(self):
+    def test_invalid_params_are_rejected_before_controller_initialization(self):
+        with patch.object(server, "get_app_controller") as get_controller:
+            result = server.dispatch(
+                "deleteSlide", {"slideIndex": "1"}, app="ppt"
+            )
+
+        self.assertFalse(result["success"])
+        self.assertEqual("INVALID_PARAMS", result["code"])
+        self.assertIn("params.slideIndex must be integer", result["error"])
+        get_controller.assert_not_called()
+
+    def test_unknown_parameter_is_rejected(self):
+        with patch.object(server, "get_app_controller") as get_controller:
+            result = server.dispatch(
+                "addSlide", {"layout": "blank", "template": "extra"}, app="ppt"
+            )
+
+        self.assertEqual("INVALID_PARAMS", result["code"])
+        self.assertIn("params.template is not allowed", result["error"])
+        get_controller.assert_not_called()
+
+    def test_invalid_success_result_is_rejected(self):
+        controller = MagicMock()
+        controller.platform = "Windows"
+        controller.execute.return_value = {
+            "success": True,
+            "data": {"slideIndex": "one", "slideCount": 1},
+        }
+        with patch.object(server, "get_app_controller", return_value=controller):
+            result = server.dispatch("addSlide", {}, app="ppt")
+
+        self.assertFalse(result["success"])
+        self.assertEqual("INVALID_RESULT", result["code"])
+        self.assertIn("result.slideIndex must be number", result["error"])
+
+    def test_server_actions_are_listed_once_as_bridge_contracts(self):
         actions = server.get_action_list()
 
         self.assertEqual(
-            [{"action": "ping", "app": "common"}],
+            [{
+                "owner": "bridge",
+                "action": "ping",
+                "description": "检查三个 Windows WPS COM 控制器的连通状态。",
+                "risk": "read",
+            }],
             [item for item in actions if item["action"] == "ping"],
         )
         self.assertEqual(
-            [{"action": "wireCheck", "app": "common"}],
+            [{
+                "owner": "bridge",
+                "action": "wireCheck",
+                "description": "检查三个 Windows WPS COM 控制器的连通状态。",
+                "risk": "read",
+            }],
             [item for item in actions if item["action"] == "wireCheck"],
         )
 
@@ -808,7 +877,7 @@ class HttpTraceTests(unittest.TestCase):
                 {
                     "traceId": client_trace.trace_id,
                     "action": "setCellValue",
-                    "params": {"cell": "A1", "value": 1},
+                    "params": {"row": 1, "col": 1, "value": 1},
                 }
             ).encode("utf-8")
             handler = object.__new__(server.Handler)

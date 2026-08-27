@@ -12,7 +12,6 @@ HTTP handler 有界并发；Action 仍严格串行进入 controller，避免 Pow
 """
 
 import json
-import re
 import sys
 import os
 import signal
@@ -29,6 +28,13 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import wps_excel
 import wps_ppt
 import wps_word
+from action_catalog import (
+    ActionCatalog,
+    ActionManifestError,
+    ActionNotSupportedError,
+    ActionValidationError,
+    UnknownActionError,
+)
 from action_trace import ActionTrace
 from service_lifecycle import (
     BridgeLifecycle,
@@ -46,20 +52,12 @@ MAX_REQUEST_BYTES = 16 * 1024 * 1024
 REQUEST_IO_TIMEOUT_SECONDS = 10
 MAX_HTTP_HANDLER_THREADS = 16
 
-# 从各控制器内嵌的 PS 脚本中解析出支持的 action 列表
-def _actions_from_module(mod):
-    return set(re.findall(r"function Exec-(\w+)\b", mod.PS_BRIDGE_SCRIPT))
-
-EXCEL_ACTIONS = _actions_from_module(wps_excel)
-PPT_ACTIONS = _actions_from_module(wps_ppt)
-WORD_ACTIONS = _actions_from_module(wps_word)
-
-# 通用 action：优先按显式 app 委派，其次按目标扩展名推断，最后兼容性回退 excel
-COMMON_ACTIONS = {
-    "save", "saveAs", "convertToPDF", "convertFormat",
-    "getSelectedText", "setSelectedText", "getAppInfo", "reconnect",
-}
-SERVER_ACTIONS = {"ping", "wireCheck"}
+try:
+    ACTION_CATALOG = ActionCatalog.from_path()
+    ACTION_MANIFEST_ERROR = None
+except ActionManifestError as exc:
+    ACTION_CATALOG = None
+    ACTION_MANIFEST_ERROR = exc
 
 def _infer_app_from_params(params):
     """从 filePath / outputPath / targetFormat 扩展名推断应用，避免 saveAs 无 app 时
@@ -83,12 +81,6 @@ APP_MODULES = {
     "excel": wps_excel,
     "ppt": wps_ppt,
     "word": wps_word,
-}
-
-APP_ACTIONS = {
-    "excel": EXCEL_ACTIONS,
-    "ppt": PPT_ACTIONS,
-    "word": WORD_ACTIONS,
 }
 
 APP_PROGIDS = {
@@ -127,7 +119,9 @@ def _normalize_app(app):
 
 
 def _supported_apps(action):
-    return [app for app, actions in APP_ACTIONS.items() if action in actions]
+    if ACTION_CATALOG is None:
+        return []
+    return [owner for owner in ACTION_CATALOG.owners_for(action) if owner in APP_MODULES]
 
 
 def route_action(action, params=None, requested_app=None):
@@ -154,28 +148,6 @@ def route_action(action, params=None, requested_app=None):
             APP_MODULES.keys(),
         )
 
-    if action in COMMON_ACTIONS:
-        if explicit_app:
-            return {
-                "app": explicit_app,
-                "source": "explicit",
-                "supportedApps": list(APP_MODULES),
-            }, None
-
-        inferred_app = _infer_app_from_params(params)
-        if inferred_app:
-            return {
-                "app": inferred_app,
-                "source": "file_extension",
-                "supportedApps": list(APP_MODULES),
-            }, None
-
-        return {
-            "app": "excel",
-            "source": "default",
-            "supportedApps": list(APP_MODULES),
-        }, None
-
     supported_apps = _supported_apps(action)
     if not supported_apps:
         return None, _route_error(
@@ -193,6 +165,22 @@ def route_action(action, params=None, requested_app=None):
         return {
             "app": explicit_app,
             "source": "explicit",
+            "supportedApps": supported_apps,
+        }, None
+
+    inferred_app = _infer_app_from_params(params)
+    if inferred_app in supported_apps:
+        return {
+            "app": inferred_app,
+            "source": "file_extension",
+            "supportedApps": supported_apps,
+        }, None
+
+    default_app = ACTION_CATALOG.routing_default(action)
+    if default_app in supported_apps:
+        return {
+            "app": default_app,
+            "source": "default",
             "supportedApps": supported_apps,
         }, None
 
@@ -221,6 +209,12 @@ def _prepare_dispatch(action, params, app=None, trace=None):
             trace.event("dispatch.rejected", status="error", code=result["code"], error=result["error"])
         return None, result
 
+    if ACTION_MANIFEST_ERROR is not None:
+        result = _route_error("INVALID_ACTION_MANIFEST", str(ACTION_MANIFEST_ERROR))
+        if trace:
+            trace.event("dispatch.rejected", status="error", code=result["code"], error=result["error"])
+        return None, result
+
     if params is None:
         params = {}
     if not isinstance(params, dict):
@@ -229,12 +223,22 @@ def _prepare_dispatch(action, params, app=None, trace=None):
             trace.event("dispatch.rejected", status="error", code=result["code"], error=result["error"])
         return None, result
 
-    if action in SERVER_ACTIONS:
+    owners = ACTION_CATALOG.owners_for(action)
+    if owners == ["bridge"]:
+        action_params = dict(params)
+        action_params.pop("app", None)
+        try:
+            ACTION_CATALOG.validate_params("bridge", action, action_params)
+        except ActionValidationError as exc:
+            result = _route_error("INVALID_PARAMS", str(exc))
+            if trace:
+                trace.event("dispatch.rejected", status="error", code=result["code"], error=result["error"])
+            return None, result
         return {
             "action": action,
-            "params": params,
+            "params": action_params,
             "requestedApp": app,
-            "route": None,
+            "route": {"app": "bridge", "source": "action_registry", "supportedApps": ["bridge"]},
             "started": dispatch_started,
         }, None
 
@@ -259,9 +263,25 @@ def _prepare_dispatch(action, params, app=None, trace=None):
             source=route["source"],
             supportedApps=route["supportedApps"],
         )
+    action_params = dict(params)
+    action_params.pop("app", None)
+    try:
+        ACTION_CATALOG.validate_params(route["app"], action, action_params)
+    except ActionValidationError as exc:
+        result = _route_error("INVALID_PARAMS", str(exc))
+        if trace:
+            trace.event(
+                "dispatch.rejected",
+                status="error",
+                action=action,
+                app=route["app"],
+                code=result["code"],
+                error=result["error"],
+            )
+        return None, result
     return {
         "action": action,
-        "params": params,
+        "params": action_params,
         "requestedApp": app,
         "route": route,
         "started": dispatch_started,
@@ -277,11 +297,15 @@ def dispatch(action, params, app=None, trace=None, prepared=None):
 
     action = prepared["action"]
     params = prepared["params"]
-    if prepared["route"] is None:
-        return handle_ping(trace=trace)
-
     route = prepared["route"]
     selected_app = route["app"]
+    if selected_app == "bridge":
+        result = handle_ping(trace=trace)
+        try:
+            ACTION_CATALOG.validate_result("bridge", action, result.get("data", {}))
+        except ActionValidationError as exc:
+            return _route_error("INVALID_RESULT", str(exc))
+        return result
     controller_started = time.perf_counter()
     try:
         ctrl = get_app_controller(selected_app, trace=trace)
@@ -320,16 +344,23 @@ def dispatch(action, params, app=None, trace=None, prepared=None):
             elapsedMs=round((time.perf_counter() - controller_started) * 1000, 2),
         )
 
-    action_params = dict(params)
-    action_params.pop("app", None)
-
     execute_started = time.perf_counter()
     try:
-        result = ctrl.execute(action, action_params, trace=trace)
+        result = ctrl.execute(action, params, trace=trace)
         if not isinstance(result, dict):
             result = {"success": True, "data": result}
     except Exception as exc:
         result = {"success": False, "error": f"执行失败: {exc}"}
+
+    if result.get("success"):
+        try:
+            ACTION_CATALOG.validate_result(
+                selected_app,
+                action,
+                result.get("data", {}),
+            )
+        except ActionValidationError as exc:
+            result = _route_error("INVALID_RESULT", str(exc))
 
     if trace:
         trace.event(
@@ -377,20 +408,10 @@ def handle_ping(trace=None):
     return result
 
 def get_action_list():
-    """返回全部可用 action 及其所属应用，供 /actions 与 SKILL.md 对齐"""
-    out = []
-    for a in sorted(EXCEL_ACTIONS):
-        if a not in COMMON_ACTIONS and a not in SERVER_ACTIONS:
-            out.append({"action": a, "app": "excel"})
-    for a in sorted(PPT_ACTIONS):
-        if a not in COMMON_ACTIONS and a not in SERVER_ACTIONS:
-            out.append({"action": a, "app": "ppt"})
-    for a in sorted(WORD_ACTIONS):
-        if a not in COMMON_ACTIONS and a not in SERVER_ACTIONS:
-            out.append({"action": a, "app": "word"})
-    for a in sorted(COMMON_ACTIONS | SERVER_ACTIONS):
-        out.append({"action": a, "app": "common"})
-    return out
+    """Return compact public contracts from the manifest-backed registry."""
+    if ACTION_MANIFEST_ERROR is not None:
+        raise ACTION_MANIFEST_ERROR
+    return ACTION_CATALOG.list()
 
 class Handler(BaseHTTPRequestHandler):
     def _send(self, obj, code=200):
@@ -406,8 +427,35 @@ class Handler(BaseHTTPRequestHandler):
         if parsed.path == "/health":
             self._send(self.server.lifecycle.health_snapshot())
         elif parsed.path == "/actions":
-            actions = get_action_list()
-            self._send({"actions": actions, "count": len(actions)})
+            try:
+                actions = get_action_list()
+                self._send({"actions": actions, "count": len(actions)})
+            except ActionManifestError as exc:
+                self._send({"success": False, "code": exc.code, "error": str(exc)}, 500)
+        elif parsed.path.startswith("/actions/"):
+            if ACTION_MANIFEST_ERROR is not None:
+                self._send({
+                    "success": False,
+                    "code": ACTION_MANIFEST_ERROR.code,
+                    "error": str(ACTION_MANIFEST_ERROR),
+                }, 500)
+                return
+            parts = parsed.path.strip("/").split("/")
+            if len(parts) != 3:
+                self._send({"success": False, "code": "UNKNOWN_ACTION", "error": "Action Contract 路径无效"}, 404)
+                return
+            _prefix, owner, action = parts
+            try:
+                self._send(ACTION_CATALOG.get(owner, action))
+            except ActionNotSupportedError as exc:
+                self._send({
+                    "success": False,
+                    "code": exc.code,
+                    "error": str(exc),
+                    "supportedApps": exc.supported_owners,
+                }, 404)
+            except UnknownActionError as exc:
+                self._send({"success": False, "code": exc.code, "error": str(exc)}, 404)
         else:
             self._send(
                 {
@@ -707,7 +755,14 @@ def main():
     server = BridgeHTTPServer((HOST, PORT), Handler, lifecycle)
     previous_handlers = _install_signal_handlers(lifecycle)
     print(f"WPS 统一桥接服务已启动: http://{HOST}:{PORT}", flush=True)
-    print(f"  支持 action: Excel {len(EXCEL_ACTIONS)} + PPT {len(PPT_ACTIONS)} + Word {len(WORD_ACTIONS)}", flush=True)
+    counts = {
+        owner: len(ACTION_CATALOG.list(owner=owner))
+        for owner in ("excel", "ppt", "word")
+    }
+    print(
+        f"  支持 contract: Excel {counts['excel']} + PPT {counts['ppt']} + Word {counts['word']}",
+        flush=True,
+    )
     print(
         f"  PID: {os.getpid()} | instance: {lifecycle.identity['instanceId']}"
         f" | idle timeout: {lifecycle.idle_timeout_seconds:g}s",
