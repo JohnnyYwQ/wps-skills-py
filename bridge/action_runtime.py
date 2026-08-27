@@ -8,6 +8,7 @@ import sys
 import threading
 import time
 from typing import Any, Callable, Mapping, Optional
+import uuid
 
 from action_catalog import ActionCatalog, ActionManifestError, ActionValidationError
 from action_trace import ActionTrace
@@ -31,6 +32,26 @@ _APP_PROGIDS = {
 
 ACTION_QUEUE_TIMEOUT_SECONDS = 600
 ACTION_EXECUTION_TIMEOUT_SECONDS = 120
+
+# Only signatures that identify a broken COM/RPC channel are recoverable.
+# WPS business errors are deliberately excluded.
+_TRANSIENT_COM_RPC_CODES = frozenset({
+    "RPC_E_DISCONNECTED",
+    "RPC_S_CALL_FAILED",
+    "RPC_S_SERVER_UNAVAILABLE",
+})
+_TRANSIENT_COM_RPC_MARKERS = (
+    "0x80010108",  # RPC_E_DISCONNECTED
+    "0x800706ba",  # RPC_S_SERVER_UNAVAILABLE
+    "0x800706be",  # RPC_S_CALL_FAILED
+    "rpc_e_disconnected",
+    "rpc_s_call_failed",
+    "rpc_s_server_unavailable",
+    "rpc server is unavailable",
+    "rpc 服务器不可用",
+    "object invoked has disconnected from its clients",
+    "调用的对象已与其客户端断开连接",
+)
 
 
 @dataclass(frozen=True)
@@ -75,17 +96,41 @@ def _normalize_app(app):
     return normalized or None
 
 
-def _supports_deadline(callback):
+def _supports_parameter(callback, name):
     try:
         signature = inspect.signature(callback)
     except (TypeError, ValueError):
         return True
     return (
-        "deadline" in signature.parameters
+        name in signature.parameters
         or any(
             parameter.kind == inspect.Parameter.VAR_KEYWORD
             for parameter in signature.parameters.values()
         )
+    )
+
+
+def _supports_deadline(callback):
+    return _supports_parameter(callback, "deadline")
+
+
+def _is_transient_com_rpc_disconnect(result):
+    """Whether a structured controller failure proves the channel was lost."""
+    if not isinstance(result, Mapping):
+        return False
+    if str(result.get("code", "")).upper() in _TRANSIENT_COM_RPC_CODES:
+        return True
+    error = str(result.get("error", "")).casefold()
+    return any(marker in error for marker in _TRANSIENT_COM_RPC_MARKERS)
+
+
+def _outcome_is_unknown(risk, result):
+    """A write is uncertain only when the controller could have lost its reply."""
+    if result.get("success") or risk == "read":
+        return False
+    return (
+        result.get("code") == "ACTION_EXECUTION_TIMEOUT"
+        or _is_transient_com_rpc_disconnect(result)
     )
 
 
@@ -126,11 +171,21 @@ class ActionRuntime:
         return factory(app, trace=trace)
 
     @staticmethod
-    def _call_controller(controller, action, params, trace, deadline):
+    def _call_controller(
+        controller,
+        action,
+        params,
+        trace,
+        deadline,
+        correlation_id,
+    ):
         execute = controller.execute
+        kwargs = {"trace": trace}
         if _supports_deadline(execute):
-            return execute(action, params, trace=trace, deadline=deadline)
-        return execute(action, params, trace=trace)
+            kwargs["deadline"] = deadline
+        if _supports_parameter(execute, "correlation_id"):
+            kwargs["correlation_id"] = correlation_id
+        return execute(action, params, **kwargs)
 
     @staticmethod
     def _ping_controller(controller, trace, deadline):
@@ -156,11 +211,24 @@ class ActionRuntime:
             except Exception:
                 pass
 
+    def _discard_controller(self, app, controller):
+        """Remove and close the controller whose COM/RPC channel was lost."""
+        with self._controller_lock:
+            if self._controllers.get(app) is controller:
+                del self._controllers[app]
+        try:
+            controller.close()
+        except Exception:
+            pass
+
     def _execution_timeout(self, deadline):
         return self._clock() >= deadline
 
     @staticmethod
     def _complete(trace, started, action, result):
+        result = dict(result)
+        if not result.get("success"):
+            result.setdefault("outcomeUnknown", False)
         trace.event(
             "action.completed",
             status="success" if result.get("success") else "error",
@@ -257,16 +325,7 @@ class ActionRuntime:
                 "code": "RUNTIME_CLOSED",
                 "error": "Action Runtime 已关闭",
             }
-            trace.event(
-                "action.completed",
-                status="error",
-                action=request.action,
-                code=result["code"],
-                error=result["error"],
-                elapsedMs=round((time.perf_counter() - started) * 1000, 2),
-            )
-            decorated = trace.decorate(result)
-            return ActionResponse(decorated, trace.trace_id, trace.log_path)
+            return self._complete(trace, started, request.action, result)
 
         if self._manifest_error is not None:
             result = _route_error(
@@ -323,6 +382,7 @@ class ActionRuntime:
             return self._complete(trace, started, request.action, route_error)
 
         selected_app = route["app"]
+        action_risk = self._catalog.get(selected_app, request.action)["risk"]
         trace.event(
             "route.selected",
             action=request.action,
@@ -352,16 +412,7 @@ class ActionRuntime:
                     code=result["code"],
                     error=result["error"],
                 )
-                trace.event(
-                    "action.completed",
-                    status="error",
-                    action=request.action,
-                    code=result["code"],
-                    error=result["error"],
-                    elapsedMs=round((time.perf_counter() - started) * 1000, 2),
-                )
-                decorated = trace.decorate(result)
-                return ActionResponse(decorated, trace.trace_id, trace.log_path)
+                return self._complete(trace, started, request.action, result)
 
         gate = self._gate_for_action()
         if gate is not None:
@@ -413,16 +464,7 @@ class ActionRuntime:
                     "code": "RUNTIME_CLOSED",
                     "error": "Action Runtime 已关闭",
                 }
-                trace.event(
-                    "action.completed",
-                    status="error",
-                    action=request.action,
-                    code=result["code"],
-                    error=result["error"],
-                    elapsedMs=round((time.perf_counter() - started) * 1000, 2),
-                )
-                decorated = trace.decorate(result)
-                return ActionResponse(decorated, trace.trace_id, trace.log_path)
+                return self._complete(trace, started, request.action, result)
             if selected_app == "bridge":
                 result = {"success": True, "data": {}}
                 execution_timed_out = False
@@ -569,16 +611,7 @@ class ActionRuntime:
                         2,
                     ),
                 )
-                trace.event(
-                    "action.completed",
-                    status="error",
-                    action=request.action,
-                    code=result["code"],
-                    error=result["error"],
-                    elapsedMs=round((time.perf_counter() - started) * 1000, 2),
-                )
-                decorated = trace.decorate(result)
-                return ActionResponse(decorated, trace.trace_id, trace.log_path)
+                return self._complete(trace, started, request.action, result)
 
             platform_name = getattr(controller, "platform", "unknown")
             backend_kind = {
@@ -608,6 +641,7 @@ class ActionRuntime:
                     action_params,
                     trace,
                     execution_deadline,
+                    uuid.uuid4().hex,
                 )
                 if not isinstance(result, dict):
                     result = {"success": True, "data": result}
@@ -630,6 +664,90 @@ class ActionRuntime:
                     "error": "Action 执行超过 120 秒预算",
                 }
             if (
+                action_risk == "read"
+                and _is_transient_com_rpc_disconnect(result)
+                and not (
+                    execution_deadline is not None
+                    and self._execution_timeout(execution_deadline)
+                )
+            ):
+                trace.event(
+                    "controller.retry.scheduled",
+                    status="retry",
+                    app=selected_app,
+                    action=request.action,
+                    nextAttempt=2,
+                    reason=result.get("error"),
+                )
+                self._discard_controller(selected_app, controller)
+                retry_started = time.perf_counter()
+                try:
+                    controller = self._new_controller(
+                        selected_app,
+                        trace,
+                        execution_deadline,
+                    )
+                    with self._controller_lock:
+                        self._controllers[selected_app] = controller
+                    if (
+                        execution_deadline is not None
+                        and self._execution_timeout(execution_deadline)
+                    ):
+                        raise TimeoutError("Action 执行预算已耗尽")
+                    trace.event(
+                        "controller.retry.rebuilt",
+                        status="success",
+                        app=selected_app,
+                        controller=type(controller).__name__,
+                        elapsedMs=round(
+                            (time.perf_counter() - retry_started) * 1000,
+                            2,
+                        ),
+                    )
+                    result = self._call_controller(
+                        controller,
+                        request.action,
+                        action_params,
+                        trace,
+                        execution_deadline,
+                        uuid.uuid4().hex,
+                    )
+                    if not isinstance(result, dict):
+                        result = {"success": True, "data": result}
+                except TimeoutError:
+                    result = {
+                        "success": False,
+                        "code": "ACTION_EXECUTION_TIMEOUT",
+                        "error": "Action 执行超过 120 秒预算",
+                    }
+                except Exception as exc:
+                    result = {
+                        "success": False,
+                        "code": "CONTROLLER_INIT_FAILED",
+                        "error": f"{selected_app} 控制器重建失败: {exc}",
+                    }
+                if (
+                    execution_deadline is not None
+                    and self._execution_timeout(execution_deadline)
+                ):
+                    result = {
+                        "success": False,
+                        "code": "ACTION_EXECUTION_TIMEOUT",
+                        "error": "Action 执行超过 120 秒预算",
+                    }
+                trace.event(
+                    "controller.retry.completed",
+                    status="success" if result.get("success") else "error",
+                    app=selected_app,
+                    action=request.action,
+                    code=result.get("code"),
+                    error=result.get("error"),
+                    elapsedMs=round(
+                        (time.perf_counter() - retry_started) * 1000,
+                        2,
+                    ),
+                )
+            if (
                 result.get("success")
                 and sys.platform == "win32"
                 and platform_name == "Windows"
@@ -646,6 +764,11 @@ class ActionRuntime:
                         "code": "INVALID_RESULT",
                         "error": str(exc),
                     }
+            if not result.get("success"):
+                result["outcomeUnknown"] = _outcome_is_unknown(
+                    action_risk,
+                    result,
+                )
         finally:
             self._execution_lock.release()
             try:

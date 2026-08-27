@@ -35,6 +35,30 @@ class _RecordingController:
         return True
 
 
+class _ScriptedController:
+    platform = "Windows"
+
+    def __init__(self, responses):
+        self._ready = True
+        self._responses = iter(responses)
+        self.calls = []
+        self.close_count = 0
+
+    def execute(self, action, params, trace=None, deadline=None, correlation_id=None):
+        self.calls.append({
+            "action": action,
+            "params": params,
+            "trace_id": trace.trace_id,
+            "deadline": deadline,
+            "correlation_id": correlation_id,
+        })
+        return next(self._responses)
+
+    def close(self):
+        self._ready = False
+        self.close_count += 1
+
+
 class _FakeActionGate:
     def __init__(self, *, acquired=True, on_acquire=None):
         self.acquired = acquired
@@ -164,6 +188,232 @@ class ActionRuntimeTests(unittest.TestCase):
         self.assertEqual("INVALID_PARAMS", result["code"])
         self.assertIn("params.slideIndex must be integer", result["error"])
         self.assertEqual([], initialized)
+
+    def test_read_action_rebuilds_the_controller_once_after_rpc_disconnect(self):
+        failed = _ScriptedController([
+            {"success": False, "error": "RPC server is unavailable (0x800706BA)"},
+        ])
+        recovered = _ScriptedController([
+            {"success": True, "data": {"sheets": [], "count": 0}},
+        ])
+        controllers = iter([failed, recovered])
+        runtime = ActionRuntime(
+            controller_factory=lambda app, trace=None, deadline=None: next(controllers),
+        )
+        try:
+            response = runtime.execute(ActionRequest(
+                action="getSheetList",
+                app="excel",
+            ))
+            result = response.to_dict()
+            events = [
+                json.loads(line)["event"]
+                for line in response.trace_log.read_text(encoding="utf-8").splitlines()
+            ]
+        finally:
+            runtime.close()
+
+        self.assertTrue(result["success"])
+        self.assertEqual(1, len(failed.calls))
+        self.assertEqual(1, len(recovered.calls))
+        self.assertEqual(failed.calls[0]["trace_id"], recovered.calls[0]["trace_id"])
+        self.assertNotEqual(
+            failed.calls[0]["correlation_id"],
+            recovered.calls[0]["correlation_id"],
+        )
+        self.assertEqual(1, failed.close_count)
+        self.assertEqual(1, recovered.close_count)
+        self.assertIn("controller.retry.scheduled", events)
+        self.assertIn("controller.retry.rebuilt", events)
+        self.assertIn("controller.retry.completed", events)
+
+    def test_read_action_does_not_retry_a_non_transient_wps_error(self):
+        controller = _ScriptedController([
+            {"success": False, "error": "工作表名称已存在"},
+        ])
+        runtime = ActionRuntime(
+            controller_factory=lambda app, trace=None, deadline=None: controller,
+        )
+        try:
+            result = runtime.execute(ActionRequest(
+                action="getSheetList",
+                app="excel",
+            )).to_dict()
+        finally:
+            runtime.close()
+
+        self.assertFalse(result["success"])
+        self.assertFalse(result["outcomeUnknown"])
+        self.assertEqual(1, len(controller.calls))
+
+    def test_read_action_returns_second_transient_failure_without_more_retries(self):
+        failed = _ScriptedController([
+            {"success": False, "error": "RPC server is unavailable (0x800706BA)"},
+        ])
+        retried = _ScriptedController([
+            {"success": False, "error": "RPC server is unavailable (0x800706BA)"},
+        ])
+        controllers = iter([failed, retried])
+        runtime = ActionRuntime(
+            controller_factory=lambda app, trace=None, deadline=None: next(controllers),
+        )
+        try:
+            result = runtime.execute(ActionRequest(
+                action="getSheetList",
+                app="excel",
+            )).to_dict()
+        finally:
+            runtime.close()
+
+        self.assertFalse(result["success"])
+        self.assertFalse(result["outcomeUnknown"])
+        self.assertEqual(1, len(failed.calls))
+        self.assertEqual(1, len(retried.calls))
+
+    def test_read_retry_uses_the_original_execution_deadline(self):
+        clock = _FakeClock()
+        gate = _FakeActionGate()
+        failed = _ScriptedController([
+            {"success": False, "error": "RPC server is unavailable (0x800706BA)"},
+        ])
+        retried = _ScriptedController([
+            {"success": True, "data": {"sheets": [], "count": 0}},
+        ])
+        original_execute = failed.execute
+
+        def fail_after_one_minute(*args, **kwargs):
+            clock.advance(60)
+            return original_execute(*args, **kwargs)
+
+        original_retry_execute = retried.execute
+
+        def finish_after_the_budget(*args, **kwargs):
+            clock.advance(61)
+            return original_retry_execute(*args, **kwargs)
+
+        failed.execute = fail_after_one_minute
+        retried.execute = finish_after_the_budget
+        received_deadlines = []
+
+        def controller_factory(app, trace=None, deadline=None):
+            received_deadlines.append(deadline)
+            return [failed, retried][len(received_deadlines) - 1]
+
+        runtime = ActionRuntime(
+            controller_factory=controller_factory,
+            action_gate_factory=lambda: gate,
+            clock=clock.monotonic,
+        )
+        try:
+            result = runtime.execute(ActionRequest(
+                action="getSheetList",
+                app="excel",
+            )).to_dict()
+        finally:
+            runtime.close()
+
+        self.assertEqual("ACTION_EXECUTION_TIMEOUT", result["code"])
+        self.assertFalse(result["outcomeUnknown"])
+        self.assertEqual([120, 120], received_deadlines)
+        self.assertEqual(1, len(failed.calls))
+        self.assertEqual(1, len(retried.calls))
+
+    def test_write_action_reports_unknown_outcome_without_retry_after_rpc_disconnect(self):
+        controller = _ScriptedController([
+            {"success": False, "error": "RPC server is unavailable (0x800706BA)"},
+        ])
+        runtime = ActionRuntime(
+            controller_factory=lambda app, trace=None, deadline=None: controller,
+        )
+        try:
+            result = runtime.execute(ActionRequest(
+                action="setCellValue",
+                app="excel",
+                params={"row": 1, "col": 1, "value": 42},
+            )).to_dict()
+        finally:
+            runtime.close()
+
+        self.assertFalse(result["success"])
+        self.assertTrue(result["outcomeUnknown"])
+        self.assertEqual(1, len(controller.calls))
+
+    def test_destructive_action_reports_unknown_outcome_without_retry_after_rpc_disconnect(self):
+        controller = _ScriptedController([
+            {"success": False, "error": "RPC server is unavailable (0x800706BA)"},
+        ])
+        runtime = ActionRuntime(
+            controller_factory=lambda app, trace=None, deadline=None: controller,
+        )
+        try:
+            result = runtime.execute(ActionRequest(
+                action="deleteSlide",
+                app="ppt",
+                params={"slideIndex": 1},
+            )).to_dict()
+        finally:
+            runtime.close()
+
+        self.assertFalse(result["success"])
+        self.assertTrue(result["outcomeUnknown"])
+        self.assertEqual(1, len(controller.calls))
+
+    def test_write_timeout_reports_an_unknown_outcome_without_retry(self):
+        controller = _ScriptedController([
+            {"success": False, "code": "ACTION_EXECUTION_TIMEOUT", "error": "action 执行超时"},
+        ])
+        runtime = ActionRuntime(
+            controller_factory=lambda app, trace=None, deadline=None: controller,
+        )
+        try:
+            result = runtime.execute(ActionRequest(
+                action="setCellValue",
+                app="excel",
+                params={"row": 1, "col": 1, "value": 42},
+            )).to_dict()
+        finally:
+            runtime.close()
+
+        self.assertFalse(result["success"])
+        self.assertTrue(result["outcomeUnknown"])
+        self.assertEqual(1, len(controller.calls))
+
+    def test_destructive_timeout_reports_an_unknown_outcome_without_retry(self):
+        controller = _ScriptedController([
+            {"success": False, "code": "ACTION_EXECUTION_TIMEOUT", "error": "action 执行超时"},
+        ])
+        runtime = ActionRuntime(
+            controller_factory=lambda app, trace=None, deadline=None: controller,
+        )
+        try:
+            result = runtime.execute(ActionRequest(
+                action="deleteSlide",
+                app="ppt",
+                params={"slideIndex": 1},
+            )).to_dict()
+        finally:
+            runtime.close()
+
+        self.assertFalse(result["success"])
+        self.assertTrue(result["outcomeUnknown"])
+        self.assertEqual(1, len(controller.calls))
+
+    def test_validation_failure_has_a_known_outcome(self):
+        runtime = ActionRuntime(controller_factory=lambda app, trace=None: (
+            self.fail("controller should not be initialized")
+        ))
+        try:
+            with patch.object(action_runtime.sys, "platform", "win32"):
+                result = runtime.execute(ActionRequest(
+                    action="deleteSlide",
+                    app="ppt",
+                    params={"slideIndex": "one"},
+                )).to_dict()
+        finally:
+            runtime.close()
+
+        self.assertEqual("INVALID_PARAMS", result["code"])
+        self.assertFalse(result["outcomeUnknown"])
 
     def test_windows_invalid_success_result_is_rejected_after_controller_execution(self):
         controller = _RecordingController()

@@ -68,7 +68,7 @@ python scripts/call.py createChart --app excel --params-file C:/tmp/chart.json
 - 日志仅保留最近 **24 小时**；有新 Action 时自动清理过期的 trace JSONL，不会清理 skill 内的其他文件。
 - trace 级别由 `bridge/action_trace.py` 顶部的 `TRACE_LEVEL` 实际值控制；常规建议设为 `"info"`，只记录时间、Action、路由应用、控制器/ProgID、平台后端、PowerShell PID、`reqId`、重试次数、耗时和错误，不记录完整参数或文档内容。用户手动改成 `"debug"` 后，LLM 无需改变 Action 调用命令。
 - `debug` 会增加**脱敏后的**参数/响应摘要：凭据字段变成 `<redacted>`，正文只记录长度与哈希，便于判断两次输入是否相同而不落原文。下一次 `call.py` 会加载代码开关；显式设置的 `WPS_TRACE=info|debug` 仍可临时覆盖代码开关。
-- 排障时先复制响应里的 `traceId`，再打开 `traceLog` 从末尾向前看。`route.rejected` 表示路由阶段失败，`controller.init.failed` 表示应用/COM 初始化失败，`powershell.stderr`、`powershell.response.timeout` 表示 PowerShell/COM 阶段失败；`controller.retry.scheduled` 后若出现 `attempt:2`，说明自动重连重试已发生。
+- 排障时先复制响应里的 `traceId`，再打开 `traceLog` 从末尾向前看。`route.rejected` 表示路由阶段失败，`controller.init.failed` 表示应用/COM 初始化失败，`powershell.stderr`、`powershell.response.timeout` 表示 PowerShell/COM 阶段失败；只读 Action 的连接恢复会依次记录 `controller.retry.scheduled`、`controller.retry.rebuilt` 和 `controller.retry.completed`。
 
 ## 二、执行链路
 
@@ -81,7 +81,7 @@ python scripts/call.py createChart --app excel --params-file C:/tmp/chart.json
 > **🟠 COM 自动化恢复与保存**
 > - **覆盖弹窗已自动抑制**：三应用初始化均设置 `DisplayAlerts = 0`，且 `saveAs`/`convertToPDF`/`convertFormat` 保存前会先删除同名目标文件，不会再出现 `OLE_E_PROMPTSAVECANCELLED` 卡死，也无需手工先删文件。
 > - **重名 Action 必须指明目标应用**：`saveAs`/`convertToPDF`/`convertFormat` 必须显式传 `--app`（如 `--app ppt`）。缺少应用不会根据文件扩展名猜测，而是返回 `AMBIGUOUS_ACTION`。
-> - **COM 异常后自动恢复**：执行中若遇偶发 COM 抖动 / "未注册对象" / RPC 断开，桥接会**自动重连并重试一次**，不会再卡在"无法重置状态"。若仍失败，可显式调用 `reconnect` 复位对应应用：`python scripts/call.py reconnect '{"app":"ppt"}'`。
+> - **COM/RPC 断开后的恢复**：仅 `risk:read` Action 遇到明确的 COM/RPC 连接断开时，Runtime 会关闭并重建 controller 后重试一次。`risk:write` 和 `risk:destructive` Action 绝不自动重放；若回执无法确认，响应会返回 `outcomeUnknown:true`，应先用只读 Action 验证活动文档状态。
 
 ```
 模型/用户
@@ -174,7 +174,7 @@ python scripts/actions.py describe addSlide --app ppt
 
 - **先看 trace**：每次响应都返回 `traceId`/`traceLog`；实机问题应随报错一起保留这两个字段。多个 Action 组成的任务需分别保留每一步的 traceId。
 - **应用未启动**：返回 `success:false` 并提示先打开对应 WPS 应用（Windows COM 需要运行中的 WPS 进程）。
-- **连接断开 / COM 异常**：桥接自动重连并重试一次；仍失败可显式 `reconnect '{"app":"ppt"}'` 复位，无需重启服务。
+- **连接断开 / COM 异常**：只读 Action 最多自动重试一次；写入或破坏性 Action 返回 `outcomeUnknown:true` 时，先执行只读 Action 验证活动文档状态，再决定是否继续。
 - **形状越界 `Value does not fall within the expected range`**：几乎都是 `shapeIndex` 传成了"位置序号"而非 `shapeId`。先用 `getShapes`/`getSlideInfo` 取回真实的 `shapeIndex`（= shapeId）再操作（见第二节关键约定）。
 - **保存前务必确认目标应用**：`saveAs` 不带 `app` 时会按 `filePath` 扩展名推断；传 `.pptx` 即走 PPT 控制器，不会再误存为 Excel 工作簿。`saveAs` 已自动抑制覆盖弹窗，无需手工删文件。
 - **文件句柄占用**：WPS 保存期间持有文件句柄，验证 `.pptx` 内容请**先复制副本再读取**（直接读取可能被锁）；`saveAs` 会返回 `size` 字段，可据此快速确认文件已生成且非空。
@@ -220,19 +220,19 @@ PYTHONPATH=bridge python -m unittest bridge/test_action_manifest.py bridge/test_
 | 1 | `setShapeStyle`/`setTextBoxStyle` 等错位一格、每页末形状丢失，报 `Value does not fall within the expected range` | `Shapes.Item(<int>)` 把"位置序号(从1)"与 `addShape` 返回的"shapeId(从2起)"混用 | 新增 `Get-ShapeById` 辅助函数，所有按形状操作的 action 一律按 `.Id` 精确定位，并抛出清晰错误；文档明确 `shapeIndex`=返回的 `shapeId` |
 | 2 | `saveAs` 不带 `app:ppt` 时静默把 Excel 工作簿另存为 .pptx，返回 `success:true`（假成功） | 路由层对通用 action 默认委派到 Excel 控制器 | 路由层在 `app` 缺省时按 `filePath` 扩展名推断应用（`.pptx→ppt` 等）；无法推断才回退 Excel，杜绝误存 |
 | 3 | 二次 `saveAs` 同名文件触发"是否覆盖"弹窗，COM 无法应答 → `OLE_E_PROMPTSAVECANCELLED` | WPS 模态对话框 COM 无法取消 | 三应用初始化设 `DisplayAlerts=0`，且 `saveAs`/`convertToPDF`/`convertFormat` 保存前先删除同名目标文件，无需手工删文件 |
-| 4 | COM 异常后"未注册对象"、无法重置状态，automation/document 等方法均无效 | 失败后无重连机制，且 PS 进程 COM 对象处于坏状态 | 桥接执行遇 COM 抖动/未注册/RPC 断开**自动重连并重试一次**；新增 `reconnect` action 手动复位指定应用 |
-| 5 | 个别形状（如 6px 超宽矩形）上色偶发失败、重试时好时坏 | WPS COM 随机抖动 | 同上自动重连重试 + `DisplayAlerts` 抑制弹窗，抖动场景下更稳定 |
+| 4 | COM/RPC 断开后无法确认回执 | 控制器的重放会让有副作用的 Action 重复执行 | Runtime 仅为 `risk:read` Action 重建 controller 后重试一次；写入和破坏性 Action 返回 `outcomeUnknown:true` 供编排者验证 |
+| 5 | 个别形状（如 6px 超宽矩形）上色偶发失败、重试时好时坏 | WPS COM 随机抖动 | 不自动重放写入；先用只读 Action 验证活动文档状态，再由编排者决定后续操作 |
 | 6 | PowerShell 5.1 下 `call.py "<json>"` 因双引号 `json.loads` 必挂（`--`/`--%`/`cmd /c` 均失败） | 宿主 shell 对 JSON 引号转义不兼容 | `call.py` 新增 `--params-file <path>` 与 `--stdin`，把 JSON 落盘/走管道，彻底绕开命令行引号 |
 | 7 | 含中文的多行 PowerShell 长命令 `MissingExpressionAfterToken` 解析崩溃 | PowerShell 多行中文解析缺陷 | 桥接命令本就是单行 JSON/逐 action；模型层改用 `--params-file`/`--stdin` 后不再需要嵌中文多行 PS |
 | 8 | `title` 版式占位符与自定义样式位置冲突 | 版式占位符占用固定位置 | 文档建议自定义演示文稿用 `addSlide` `layout:"blank"` 从零绘制，`title_content` 仅用于快速标准页 |
 | 9 | WPS 保存期持文件句柄，无法直接读取验证内容 | 进程占用 | `saveAs` 返回 `size` 字段便于快速确认；文档提示"验证前先复制副本" |
 | 10 | 被迫绕过 `call.py` 直接调 HTTP 端点（未审计脚本） | `call.py` CLI 形式在本机不通用 | `call.py` 已通用化（`--params-file`/`--stdin`），并负责实例身份校验；未经身份绑定的直接 HTTP 调用会被拒绝 |
 | 11 | 重名 Action 可能被固定优先级静默路由到错误应用 | Action 名不足以唯一确定 Excel/PPT/Word | `findReplace`、`insertImage` 等重名 Action 必须显式传顶层 `app`/CLI `--app`；路由失败会在 trace 中记录候选应用 |
-| 12 | COM 自动重试生成了新 `reqId`，却可能重发带旧 `reqId` 的命令并等待至超时 | 重试复用了第一次序列化后的命令 | 每次尝试重新生成并序列化命令：`reqId` 随尝试变化，Action `traceId` 保持不变 |
+| 12 | 只读 Action 的 COM/RPC 断开需要安全恢复 | 一次 Action 内只能保留一个 `traceId`，但每次底层请求必须独立关联 | Runtime 重建 controller 后才执行第二次只读尝试；Action `traceId` 保持不变，PowerShell 请求仍带独立 `reqId` |
 | 13 | 实机失败只能看到最终错误，无法判断卡在自动启动、路由、PowerShell 还是 COM | 各层没有统一关联标识，stderr 也未持续消费 | 新增默认开启的 Action JSONL trace，贯穿完整执行链并持续排空 PowerShell stderr；响应始终返回定位信息，日志保留 24 小时 |
 | 14 | `call.py` 退出后 bridge/PowerShell 长期驻留，并可能误复用另一 checkout 的旧服务 | 服务没有任务结束协议、空闲回收或实例身份 | 新增 `service.py status/stop/restart`、15 分钟空闲回收、checkout+代码+实例三重校验和优雅控制器关闭；Skill 强制在保存验证后显式 stop |
 
-> 当前卡点（"8 页内容 + 159 项样式已就位，卡在最后保存的同名覆盖弹窗"）已由 #3 的 `DisplayAlerts=0` + 保存前删目标 + #4 的自动重连彻底解决：直接 `python scripts/call.py saveAs '{"app":"ppt","filePath":"目标.pptx"}'` 即可落盘，无需先手工删除旧空壳文件。
+> 当写入或破坏性 Action 在 COM/RPC 断开后返回 `outcomeUnknown:true` 时，先用相应的只读 Action 验证活动文档状态；不要重放原 Action。
 
 ---
 

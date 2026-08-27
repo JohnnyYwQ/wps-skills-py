@@ -146,7 +146,7 @@ class ControllerTraceTests(unittest.TestCase):
                 self.assertFalse(controller._ready)
                 self.assertIsNone(controller._ps_process)
 
-    def test_retry_uses_new_req_id_but_keeps_same_action_trace(self):
+    def test_windows_controllers_make_one_attempt_even_after_rpc_disconnect(self):
         cases = (
             (wps_excel.WpsExcelController, "setCellValue"),
             (wps_ppt.WpsPptController, "addSlide"),
@@ -166,33 +166,76 @@ class ControllerTraceTests(unittest.TestCase):
                     controller._id_counter = 0
                     controller._id_lock = threading.Lock()
                     controller._stop = None
-                    controller._reinit_windows = Mock()
                     controller._read_result = Mock(
-                        side_effect=[
-                            {"success": False, "error": "RPC 服务器不可用"},
-                            {"success": True, "data": {"ok": True}},
-                        ]
+                        return_value={
+                            "success": False,
+                            "error": "RPC 服务器不可用",
+                        },
                     )
 
                     result = controller._exec_windows(action, {}, trace=trace)
 
-                    self.assertTrue(result["success"])
+                    self.assertFalse(result["success"])
                     commands = [
                         json.loads(line)
                         for line in controller._ps_process.stdin.lines
                         if line.strip()
                     ]
-                    self.assertEqual([1, 2], [command["reqId"] for command in commands])
-                    self.assertEqual([1, 2], [command["attempt"] for command in commands])
+                    self.assertEqual([1], [command["reqId"] for command in commands])
+                    self.assertEqual([1], [command["attempt"] for command in commands])
                     self.assertEqual(
-                        [trace.trace_id, trace.trace_id],
+                        [trace.trace_id],
                         [command["traceId"] for command in commands],
                     )
                     events = [
                         json.loads(line)["event"]
                         for line in trace.log_path.read_text(encoding="utf-8").splitlines()
                     ]
-                    self.assertIn("controller.retry.scheduled", events)
+                    self.assertNotIn("controller.retry.scheduled", events)
+
+    def test_windows_controllers_use_the_runtime_correlation_id(self):
+        cases = (
+            (wps_excel.WpsExcelController, "setCellValue"),
+            (wps_ppt.WpsPptController, "addSlide"),
+            (wps_word.WpsWordController, "insertText"),
+        )
+        for controller_type, action in cases:
+            with self.subTest(controller=controller_type.__name__):
+                controller = object.__new__(controller_type)
+                controller._ps_process = _RunningProcess()
+                controller._ready = True
+                controller._id_counter = 0
+                controller._id_lock = threading.Lock()
+                controller._stop = None
+                controller._read_result = Mock(return_value={"success": True})
+
+                controller._exec_windows(
+                    action,
+                    {},
+                    correlation_id="runtime-retry-2",
+                )
+
+                command = json.loads(controller._ps_process.stdin.lines[0])
+                self.assertEqual("runtime-retry-2", command["reqId"])
+
+    def test_windows_controller_timeout_is_structured(self):
+        cases = (
+            (wps_excel, wps_excel.WpsExcelController),
+            (wps_ppt, wps_ppt.WpsPptController),
+            (wps_word, wps_word.WpsWordController),
+        )
+        for module, controller_type in cases:
+            with self.subTest(controller=controller_type.__name__):
+                controller = object.__new__(controller_type)
+                controller._ready = True
+                controller._ps_process = None
+                controller._stop = None
+                controller._stderr_queue = queue.Queue()
+
+                with patch.object(module, "bounded_timeout", return_value=0):
+                    result = controller._read_result(7)
+
+                self.assertEqual("ACTION_EXECUTION_TIMEOUT", result["code"])
 
     def test_backend_timing_and_stderr_are_recorded_but_not_returned(self):
         cases = (

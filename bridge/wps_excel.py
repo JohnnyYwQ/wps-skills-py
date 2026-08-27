@@ -37,13 +37,6 @@ EXCEL_PROGID = "Ket.Application"
 # 单个 action 执行超时（秒）：超过则强杀 PowerShell 桥接进程，避免 COM 弹框导致永久卡死
 EXEC_TIMEOUT = 60
 
-# 偶发 COM 故障特征串（小写匹配，用于自动重连重试，避免“未注册对象”后无法重置状态）
-COM_FAIL_HINTS = (
-    "未注册对象", "未注册", "80040154", "rpc 服务器不可用", "800706ba",
-    "rpc_e_disconnected", "调用的对象已与其客户端断开连接",
-    "ole_e_promptsavecancelled", "8004000c", "catastrophic", "灾难性",
-)
-
 # PowerShell 桥接脚本（持久进程模式）
 PS_BRIDGE_SCRIPT = r'''
 $OutputEncoding = [System.Text.Encoding]::UTF8
@@ -1213,15 +1206,6 @@ class WpsExcelController:
             self._stop.set()
         stop_line_process(process)
 
-    def _reinit_windows(self, trace=None, deadline=None):
-        """销毁旧进程并重新初始化（用于 WPS 断开后的自动重连）"""
-        self._kill_ps()
-        self._init_windows(trace=trace, deadline=deadline)
-
-    def _is_com_failure(self, err):
-        e = (err or "").lower()
-        return any(h in e for h in COM_FAIL_HINTS)
-
     def _read_result(self, req_id, trace=None, attempt=1, started=None, deadline=None):
         started = started or time.perf_counter()
         timeout = bounded_timeout(EXEC_TIMEOUT, deadline)
@@ -1241,8 +1225,11 @@ class WpsExcelController:
                         elapsedMs=round((time.perf_counter() - started) * 1000, 2),
                     )
                 self._kill_ps()
-                return {"success": False,
-                        "error": f"action 执行超时（>{EXEC_TIMEOUT}s），已终止 WPS 桥接进程"}
+                return {
+                    "success": False,
+                    "code": "ACTION_EXECUTION_TIMEOUT",
+                    "error": f"action 执行超时（>{EXEC_TIMEOUT}s），已终止 WPS 桥接进程",
+                }
             try:
                 raw = self._queue.get(timeout=remaining)
             except queue.Empty:
@@ -1258,7 +1245,11 @@ class WpsExcelController:
                         elapsedMs=round((time.perf_counter() - started) * 1000, 2),
                     )
                 self._kill_ps()
-                return {"success": False, "error": f"action 执行超时（>{EXEC_TIMEOUT}s）"}
+                return {
+                    "success": False,
+                    "code": "ACTION_EXECUTION_TIMEOUT",
+                    "error": f"action 执行超时（>{EXEC_TIMEOUT}s）",
+                }
             raw = raw.strip()
             if not raw:
                 continue
@@ -1305,8 +1296,10 @@ class WpsExcelController:
                 )
             continue
 
-    def _run_windows_attempt(self, action, params, attempt, trace=None, deadline=None):
-        req_id = self._next_id()
+    def _run_windows_attempt(
+        self, action, params, attempt, trace=None, deadline=None, correlation_id=None,
+    ):
+        req_id = correlation_id if correlation_id is not None else self._next_id()
         command = {
             "reqId": req_id,
             "traceId": trace.trace_id if trace else None,
@@ -1352,8 +1345,10 @@ class WpsExcelController:
             deadline=deadline,
         )
 
-    def _exec_windows(self, action: str, params: dict, trace=None, deadline=None) -> dict:
-        """通过 PowerShell COM 执行 action（同一 trace 下最多两次尝试）。"""
+    def _exec_windows(
+        self, action: str, params: dict, trace=None, deadline=None, correlation_id=None,
+    ) -> dict:
+        """通过 PowerShell COM 执行一次 Action。"""
         if not self._ps_process or self._ps_process.poll() is not None:
             self._ready = False
             if trace:
@@ -1363,38 +1358,12 @@ class WpsExcelController:
                     app="excel",
                     action=action,
                 )
-            return {"success": False, "error": "PowerShell 进程已退出，请重启桥接服务"}
+            return {"success": False, "error": "PowerShell 进程已退出"}
 
-        result = self._run_windows_attempt(
+        return self._run_windows_attempt(
             action, params, attempt=1, trace=trace, deadline=deadline,
+            correlation_id=correlation_id,
         )
-        # 偶发 COM 抖动 / “未注册对象” / 覆盖弹窗取消等：重连桥接后自动重试一次
-        if (not result.get("success")) and self._is_com_failure(result.get("error", "")):
-            if trace:
-                trace.event(
-                    "controller.retry.scheduled",
-                    status="retry",
-                    app="excel",
-                    action=action,
-                    nextAttempt=2,
-                    reason=result.get("error"),
-                )
-            try:
-                self._reinit_windows(trace=trace, deadline=deadline)
-            except Exception as exc:
-                if trace:
-                    trace.event(
-                        "controller.retry.reinit_failed",
-                        status="error",
-                        app="excel",
-                        action=action,
-                        error=f"{type(exc).__name__}: {exc}",
-                    )
-            if self._ps_process and self._ps_process.poll() is None:
-                result = self._run_windows_attempt(
-                    action, params, attempt=2, trace=trace, deadline=deadline,
-                )
-        return result
 
     # ==================== Linux: 文件级后端（vendored openpyxl） ====================
 
@@ -1440,17 +1409,17 @@ class WpsExcelController:
 
     # ==================== 统一执行入口 ====================
 
-    def execute(self, action: str, params: dict = None, trace=None, deadline=None) -> dict:
+    def execute(
+        self, action: str, params: dict = None, trace=None, deadline=None, correlation_id=None,
+    ) -> dict:
         """统一执行入口 - 所有 action 通过此处调用"""
         if params is None:
             params = {}
 
-        # 未连接时尝试自动重连一次（用户在会话中途关闭 WPS 后可自愈）
+        # Runtime owns Windows controller recreation and retry policy.
         if not self._ready and action != "ping":
             try:
-                if IS_WINDOWS:
-                    self._reinit_windows(trace=trace, deadline=deadline)
-                elif IS_LINUX:
+                if IS_LINUX:
                     self._init_linux(trace=trace)
             except Exception as e:
                 return {"success": False, "error": f"WPS Excel 未连接，且重连失败: {e}"}
@@ -1459,7 +1428,10 @@ class WpsExcelController:
             return {"success": False, "error": "WPS Excel 未连接"}
 
         if IS_WINDOWS:
-            return self._exec_windows(action, params, trace=trace, deadline=deadline)
+            return self._exec_windows(
+                action, params, trace=trace, deadline=deadline,
+                correlation_id=correlation_id,
+            )
         elif IS_LINUX:
             return self._exec_linux(action, params, trace=trace)
         else:
