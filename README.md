@@ -134,6 +134,8 @@ logs/server-YYYY-MM-DD.log
 ```bash
 PYTHONPATH=bridge python -m unittest \
   bridge/test_action_trace.py \
+  bridge/test_windows_com.py \
+  bridge/test_install_check.py \
   bridge/test_server_routing.py \
   bridge/test_controller_trace.py \
   bridge/test_service_lifecycle.py \

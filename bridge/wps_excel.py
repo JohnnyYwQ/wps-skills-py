@@ -22,6 +22,7 @@ import threading
 from typing import Any, Dict, Optional
 
 from service_lifecycle import stop_line_process
+from windows_com import describe_powershell_startup_failure, resolve_com_runtime
 
 # ==================== 平台检测 ====================
 IS_WINDOWS = platform.system() == "Windows"
@@ -46,6 +47,7 @@ PS_BRIDGE_SCRIPT = r'''
 $OutputEncoding = [System.Text.Encoding]::UTF8
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 $error.Clear()
+$global:WpsActivationError = $null
 
 # 创建/获取 COM 对象
 function Get-ExcelApp {
@@ -53,6 +55,8 @@ function Get-ExcelApp {
     catch {
         try { return New-Object -ComObject 'Ket.Application' }
         catch {
+            $hr = '0x{0:X8}' -f $_.Exception.HResult
+            $global:WpsActivationError = "New-Object failed ($hr): $($_.Exception.Message)"
             try {
                 $clsid = (Get-ItemProperty -Path 'HKCU:\Software\Classes\Ket.Application\CLSID' -ErrorAction Stop).'(default)'
                 if ($clsid) {
@@ -72,7 +76,12 @@ if ($global:excel) {
     try { $global:excel.DisplayAlerts = $false } catch {}
     Write-Host '{"ready":true}'
 } else {
-    Write-Host '{"ready":false,"error":"无法连接WPS Excel，请确认WPS已安装"}'
+    $message = if ($global:WpsActivationError) {
+        $global:WpsActivationError
+    } else {
+        '无法连接WPS Excel，请确认WPS已安装'
+    }
+    Write-Host (@{ready=$false; error=$message} | ConvertTo-Json -Compress)
     exit 1
 }
 
@@ -1038,9 +1047,22 @@ class WpsExcelController:
     def _init_windows(self, trace=None):
         """初始化 Windows PowerShell COM 桥接进程"""
         started = time.perf_counter()
-        if trace:
-            trace.event("powershell.process.starting", app="excel", progId=EXCEL_PROGID)
         try:
+            com_runtime = resolve_com_runtime(EXCEL_PROGID)
+            if not com_runtime.available:
+                raise RuntimeError(
+                    f"{EXCEL_PROGID} COM 注册不完整: {com_runtime.diagnostic}"
+                )
+            selected_registration = com_runtime.selected_registration
+            if trace:
+                trace.event(
+                    "powershell.process.starting",
+                    app="excel",
+                    progId=EXCEL_PROGID,
+                    clsid=(selected_registration.clsid if selected_registration else None),
+                    registryViewBits=com_runtime.selected_view_bitness,
+                    powershellExecutable=com_runtime.powershell_executable,
+                )
             # 写入临时 PS1 脚本
             # 注意：必须带 BOM(utf-8-sig)。PowerShell 5.1 在中文 Windows 上默认按系统 ANSI
             # (GBK) 解析无 BOM 的 .ps1，脚本中的中文会被读成乱码从而破坏字符串字面量，
@@ -1053,13 +1075,14 @@ class WpsExcelController:
 
             # 启动持久 PowerShell 进程
             self._ps_process = subprocess.Popen(
-                ['powershell.exe', '-NoProfile', '-NoLogo',
+                [com_runtime.powershell_executable, '-NoProfile', '-NoLogo',
                  '-ExecutionPolicy', 'Bypass', '-File', self._ps_script.name],
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
                 encoding='utf-8',
+                errors='replace',
                 bufsize=1
             )
 
@@ -1073,7 +1096,12 @@ class WpsExcelController:
             ready = json.loads(ready_line) if ready_line else {}
             self._ready = ready.get('ready', False)
             if not self._ready:
-                err = ready.get('error', '未知错误')
+                err = describe_powershell_startup_failure(
+                    self._ps_process,
+                    self._stderr_reader,
+                    self._stderr_queue,
+                    ready.get('error'),
+                )
                 self._kill_ps()
                 raise RuntimeError(f"WPS Excel 连接失败: {err}")
 

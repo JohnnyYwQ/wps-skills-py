@@ -112,13 +112,16 @@ def _fallback_log_root() -> Path:
 def _check_writable(root: Path) -> None:
     traces = root / "traces"
     traces.mkdir(parents=True, exist_ok=True)
-    probe = traces / f".write-test-{os.getpid()}-{uuid.uuid4().hex}"
+    # Keep one stable marker so a sandbox that permits writes but denies deletes
+    # does not turn a successful probe into a false "directory not writable"
+    # result or accumulate random probe files.
+    probe = traces / ".write-test"
     try:
         probe.write_text("ok", encoding="utf-8")
     finally:
         try:
             probe.unlink()
-        except FileNotFoundError:
+        except OSError:
             pass
 
 

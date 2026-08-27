@@ -1,9 +1,11 @@
 import json
+import io
 import os
 import queue
 import tempfile
 import threading
 import unittest
+from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 from action_trace import ActionTrace
@@ -33,6 +35,92 @@ class _RunningProcess:
 
 
 class ControllerTraceTests(unittest.TestCase):
+    def test_windows_controllers_launch_the_resolved_powershell_executable(self):
+        cases = (
+            (wps_excel, wps_excel.WpsExcelController),
+            (wps_ppt, wps_ppt.WpsPptController),
+            (wps_word, wps_word.WpsWordController),
+        )
+        executable = r"C:\Windows\SysWOW64\WindowsPowerShell\v1.0\powershell.exe"
+        resolution = SimpleNamespace(
+            available=True,
+            powershell_executable=executable,
+            selected_view_bitness=32,
+            selected_registration=SimpleNamespace(clsid="{WPS-CLSID}"),
+            diagnostic="",
+        )
+        for module, controller_type in cases:
+            with self.subTest(controller=controller_type.__name__):
+                process = Mock()
+                process.stdin = io.StringIO()
+                process.stdout = io.StringIO('{"ready":true}\n')
+                process.stderr = io.StringIO("")
+                process.pid = 4321
+                process.poll.return_value = None
+                process.wait.return_value = 0
+                with patch.object(module, "IS_WINDOWS", True), patch.object(
+                    module,
+                    "IS_LINUX",
+                    False,
+                ), patch.object(
+                    module,
+                    "resolve_com_runtime",
+                    return_value=resolution,
+                ), patch.object(
+                    module.subprocess,
+                    "Popen",
+                    return_value=process,
+                ) as popen:
+                    controller = controller_type()
+                    try:
+                        command = popen.call_args.args[0]
+                        self.assertEqual(executable, command[0])
+                        self.assertEqual("replace", popen.call_args.kwargs["errors"])
+                    finally:
+                        controller.close()
+
+    def test_windows_controller_startup_failure_includes_exit_code_and_stderr(self):
+        cases = (
+            (wps_excel, wps_excel.WpsExcelController),
+            (wps_ppt, wps_ppt.WpsPptController),
+            (wps_word, wps_word.WpsWordController),
+        )
+        resolution = SimpleNamespace(
+            available=True,
+            powershell_executable=r"C:\Windows\System32\powershell.exe",
+            selected_view_bitness=64,
+            selected_registration=SimpleNamespace(clsid="{WPS-CLSID}"),
+            diagnostic="",
+        )
+        for module, controller_type in cases:
+            with self.subTest(controller=controller_type.__name__):
+                process = Mock()
+                process.stdin = io.StringIO()
+                process.stdout = io.StringIO("")
+                process.stderr = io.StringIO("native COM activation failure\n")
+                process.pid = 4321
+                process.poll.return_value = 7
+                process.wait.return_value = 7
+                with patch.object(module, "IS_WINDOWS", True), patch.object(
+                    module,
+                    "IS_LINUX",
+                    False,
+                ), patch.object(
+                    module,
+                    "resolve_com_runtime",
+                    return_value=resolution,
+                ), patch.object(
+                    module.subprocess,
+                    "Popen",
+                    return_value=process,
+                ):
+                    with self.assertRaises(RuntimeError) as raised:
+                        controller_type()
+
+                message = str(raised.exception)
+                self.assertIn("exit code 7", message)
+                self.assertIn("native COM activation failure", message)
+
     def test_controller_close_waits_for_clean_powershell_exit(self):
         controller_types = (
             wps_excel.WpsExcelController,

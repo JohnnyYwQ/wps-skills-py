@@ -13,6 +13,12 @@ import os
 import platform
 import json
 
+BRIDGE_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "bridge")
+if BRIDGE_DIR not in sys.path:
+    sys.path.insert(0, BRIDGE_DIR)
+
+from windows_com import resolve_com_runtime
+
 def check_python():
     """检查 Python 版本"""
     v = sys.version_info
@@ -43,19 +49,6 @@ def check_platform():
         return False
 
 
-def _check_progid(progid):
-    """检查指定 WPS 应用的 COM ProgID 是否在注册表注册"""
-    try:
-        import winreg
-        try:
-            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, rf"Software\Classes\{progid}\CLSID") as key:
-                return winreg.QueryValue(key, "")
-        except FileNotFoundError:
-            with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, rf"SOFTWARE\Classes\{progid}\CLSID") as key:
-                return winreg.QueryValue(key, "")
-    except Exception:
-        return None
-
 def check_wps():
     """检查 WPS Office 三应用 COM 是否注册"""
     s = platform.system()
@@ -67,11 +60,21 @@ def check_wps():
         }
         ok = True
         for progid, label in progs.items():
-            clsid = _check_progid(progid)
-            if clsid:
-                print(f"  [OK] {label} COM: {progid} (CLSID: {clsid})")
+            resolution = resolve_com_runtime(progid)
+            if resolution.available:
+                registration = resolution.selected_registration
+                print(
+                    f"  [OK] {label} COM: {progid} "
+                    f"({resolution.selected_view_bitness}-bit view; "
+                    f"CLSID: {registration.clsid}; "
+                    f"{registration.activation_kind}; "
+                    f"PowerShell: {resolution.powershell_executable})"
+                )
             else:
-                print(f"  [警告] 未找到 {label} COM 注册({progid})，请确认 WPS 已安装")
+                print(
+                    f"  [警告] {label} COM 注册不可激活({progid}): "
+                    f"{resolution.diagnostic}"
+                )
                 ok = False
         return ok
     elif s == "Linux":
@@ -104,6 +107,7 @@ def check_files():
         ("SKILL.md", "技能定义文件"),
         ("bridge/action_trace.py", "Action 结构化追踪与 24 小时保留"),
         ("bridge/service_lifecycle.py", "bridge 实例身份与生命周期"),
+        ("bridge/windows_com.py", "Windows COM 注册视图与 PowerShell 解析"),
         ("bridge/server.py", "统一桥接服务"),
         ("bridge/wps_excel.py", "WPS Excel 控制器"),
         ("bridge/wps_ppt.py", "WPS PPT 控制器"),
@@ -116,7 +120,6 @@ def check_files():
         ("scripts/service.py", "bridge 生命周期命令"),
         ("vendor/openpyxl/__init__.py", "vendored openpyxl（Linux Excel 后端依赖，无需 pip）"),
         ("vendor/et_xmlfile/__init__.py", "vendored et_xmlfile（openpyxl 依赖）"),
-        ("config.json", "配置文件"),
     ]
 
     all_ok = True

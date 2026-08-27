@@ -93,6 +93,7 @@ local.config.ts
 # 日志和临时文件
 # ============================================
 logs/
+logs-old/
 *.log
 tmp/
 temp/
