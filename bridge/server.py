@@ -404,7 +404,34 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         parsed = urlparse(self.path)
         if parsed.path == "/health":
-            self._send(self.server.lifecycle.health_snapshot())
+            trace_id = self.headers.get("X-WPS-Trace-Id")
+            trace = ActionTrace.resume(trace_id, component="server") if trace_id else None
+            started = time.perf_counter()
+            if trace:
+                trace.event(
+                    "bridge.health.received",
+                    serverPid=os.getpid(),
+                    instanceId=self.server.lifecycle.identity.get("instanceId"),
+                )
+            try:
+                self._send(self.server.lifecycle.health_snapshot())
+            except Exception as exc:
+                if trace:
+                    trace.event(
+                        "bridge.health.response_failed",
+                        status="error",
+                        serverPid=os.getpid(),
+                        error=f"{type(exc).__name__}: {exc}",
+                        elapsedMs=round((time.perf_counter() - started) * 1000, 2),
+                    )
+                raise
+            if trace:
+                trace.event(
+                    "bridge.health.responded",
+                    status="success",
+                    serverPid=os.getpid(),
+                    elapsedMs=round((time.perf_counter() - started) * 1000, 2),
+                )
         elif parsed.path == "/actions":
             actions = get_action_list()
             self._send({"actions": actions, "count": len(actions)})

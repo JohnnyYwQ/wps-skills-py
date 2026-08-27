@@ -1,15 +1,18 @@
 import io
 import json
+import os
 import socket
 from socketserver import BaseRequestHandler
 import threading
 import time
+import tempfile
 import unittest
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 from urllib.request import Request, urlopen
 
 import server
+from action_trace import ActionTrace
 from service_lifecycle import BridgeLifecycle, build_service_identity
 
 
@@ -94,6 +97,33 @@ class ShutdownEndpointTests(unittest.TestCase):
         self.assertEqual(self.identity["instanceId"], captured["result"]["instanceId"])
         self.assertEqual(self.identity["projectRoot"], captured["result"]["projectRoot"])
         self.assertIn("pid", captured["result"])
+
+    def test_health_trace_records_server_receive_and_response(self):
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(
+            os.environ,
+            {"WPS_TRACE_DIR": tmp},
+            clear=False,
+        ):
+            client_trace = ActionTrace.start(component="call")
+            handler, _ = _handler(
+                "/health",
+                self.lifecycle,
+                headers={"X-WPS-Trace-Id": client_trace.trace_id},
+            )
+
+            handler.do_GET()
+
+            events = [
+                json.loads(line)
+                for line in client_trace.log_path.read_text(encoding="utf-8").splitlines()
+            ]
+
+        self.assertEqual(
+            ["bridge.health.received", "bridge.health.responded"],
+            [row["event"] for row in events],
+        )
+        self.assertEqual(os.getpid(), events[-1]["serverPid"])
+        self.assertGreaterEqual(events[-1]["elapsedMs"], 0)
 
     def test_shutdown_requests_graceful_exit(self):
         handler, captured = _handler(

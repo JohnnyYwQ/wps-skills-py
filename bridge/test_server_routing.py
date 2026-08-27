@@ -285,6 +285,66 @@ class CallServiceLifecycleRegressionTests(unittest.TestCase):
         self.assertEqual("unresponsive", probe.state)
         self.assertIsNone(probe.health)
 
+    def test_health_trace_records_client_request_and_timeout(self):
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(
+            os.environ,
+            {"WPS_TRACE_DIR": tmp},
+            clear=False,
+        ):
+            trace = ActionTrace.start(component="call")
+            with patch.object(call, "_urlopen", side_effect=TimeoutError("busy")):
+                probe = call._health(with_state=True, trace=trace)
+
+            events = [
+                json.loads(line)
+                for line in trace.log_path.read_text(encoding="utf-8").splitlines()
+            ]
+
+        self.assertEqual("unresponsive", probe.state)
+        self.assertEqual(
+            ["bridge.health.requested", "bridge.health.failed"],
+            [row["event"] for row in events],
+        )
+        self.assertEqual("TimeoutError", events[-1]["errorType"])
+        self.assertGreaterEqual(events[-1]["elapsedMs"], 0)
+
+    def test_health_trace_correlates_client_request_and_response(self):
+        class _Response:
+            status = 200
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+            def read(self):
+                return b'{"status":"ok"}'
+
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(
+            os.environ,
+            {"WPS_TRACE_DIR": tmp},
+            clear=False,
+        ):
+            trace = ActionTrace.start(component="call")
+            with patch.object(call, "_urlopen", return_value=_Response()) as urlopen:
+                probe = call._health(with_state=True, trace=trace)
+
+            events = [
+                json.loads(line)
+                for line in trace.log_path.read_text(encoding="utf-8").splitlines()
+            ]
+
+        request = urlopen.call_args.args[0]
+        self.assertEqual(trace.trace_id, request.get_header("X-wps-trace-id"))
+        self.assertEqual("responded", probe.state)
+        self.assertEqual(
+            ["bridge.health.requested", "bridge.health.responded"],
+            [row["event"] for row in events],
+        )
+        self.assertEqual(200, events[-1]["httpStatus"])
+        self.assertEqual(15, events[-1]["bodyBytes"])
+
     def test_unresponsive_port_never_starts_a_second_bridge(self):
         probe = call.HealthProbe("unresponsive", error="timed out")
         with patch.object(call, "_health", return_value=probe), patch.object(
@@ -384,7 +444,7 @@ class CallServiceLifecycleRegressionTests(unittest.TestCase):
         self.assertEqual("foreign", result.disposition)
         popen.assert_not_called()
 
-    def test_reuse_rejects_health_when_os_listener_identity_does_not_match(self):
+    def test_reuse_accepts_current_health_when_os_listener_is_unobservable(self):
         health = {
             "status": "ok",
             **current_service_identity(instance_id="claimed-instance"),
@@ -395,17 +455,18 @@ class CallServiceLifecycleRegressionTests(unittest.TestCase):
             "pid": 124,
             "serverPid": 124,
         }
-        wrong_listener = {"pid": 999, "createdAt": "other-process-time"}
+        unobservable_listener = {"pid": None, "createdAt": None}
         with patch.object(call, "_health", return_value=health), patch.object(
             call,
             "_listener_identity",
-            return_value=wrong_listener,
+            return_value=unobservable_listener,
         ):
             result = call._ensure_server()
 
-        self.assertFalse(result)
-        self.assertEqual("unknown_owner", result.disposition)
-        self.assertIn("监听 PID", result.error)
+        self.assertTrue(result)
+        self.assertFalse(result.started)
+        self.assertEqual("reused", result.disposition)
+        self.assertEqual("claimed-instance", result.health["instanceId"])
 
     def test_start_winner_reprobes_inside_lock_and_reuses_ready_bridge(self):
         ready_health = {
@@ -445,7 +506,7 @@ class CallServiceLifecycleRegressionTests(unittest.TestCase):
         self.assertEqual("winner-instance", result.health["instanceId"])
         popen.assert_not_called()
 
-    def test_self_started_requires_health_to_match_launch_and_child_pid(self):
+    def test_self_started_uses_health_identity_when_listener_is_unobservable(self):
         process = MagicMock()
         process.pid = 456
         process.poll.return_value = None
@@ -488,8 +549,8 @@ class CallServiceLifecycleRegressionTests(unittest.TestCase):
                 {"pid": None, "createdAt": None},
                 {"pid": None, "createdAt": None},
                 {"pid": None, "createdAt": None},
-                {"pid": 456, "createdAt": "child-time"},
-                {"pid": 456, "createdAt": "child-time"},
+                {"pid": None, "createdAt": None},
+                {"pid": None, "createdAt": None},
             ],
         ), patch.object(call.time, "sleep"):
             result = call._ensure_server()

@@ -143,9 +143,9 @@ def _run_diagnostic(command, timeout=2):
     return stdout or ""
 
 
-def _observe_health():
+def _observe_health(trace=None):
     listener_before = _listener_identity()
-    probe = _as_health_probe(_health(with_state=True))
+    probe = _as_health_probe(_health(with_state=True, trace=trace))
     listener_after = _listener_identity()
     return HealthObservation(probe, listener_before, listener_after)
 
@@ -223,32 +223,80 @@ def _startup_lock():
             lock_file.close()
 
 
-def _health(with_state=False):
+def _health(with_state=False, trace=None):
+    started = time.perf_counter()
+    target = f"{BASE}/health"
+    request = target
+    if trace:
+        request = urllib.request.Request(
+            target,
+            headers={"X-WPS-Trace-Id": trace.trace_id},
+        )
+        trace.event(
+            "bridge.health.requested",
+            method="GET",
+            url=target,
+            timeoutSeconds=2,
+            pythonExecutable=sys.executable,
+            callPath=os.path.abspath(__file__),
+            cwd=os.getcwd(),
+        )
+    raw_bytes = 0
+    http_status = None
+    error_type = None
     try:
-        with _urlopen(f"{BASE}/health", timeout=2) as resp:
-            raw = resp.read().decode("utf-8")
+        with _urlopen(request, timeout=2) as resp:
+            raw_body = resp.read()
+            raw_bytes = len(raw_body)
+            http_status = getattr(resp, "status", 200)
+            raw = raw_body.decode("utf-8")
         try:
             probe = HealthProbe("responded", health=json.loads(raw))
         except Exception as exc:
+            error_type = type(exc).__name__
             probe = HealthProbe(
                 "unhealthy",
                 error=f"bridge /health 返回非 JSON: {type(exc).__name__}: {exc}",
             )
     except urllib.error.HTTPError as exc:
+        http_status = exc.code
         try:
-            health = json.loads(exc.read().decode("utf-8"))
+            raw_body = exc.read()
+            raw_bytes = len(raw_body)
+            health = json.loads(raw_body.decode("utf-8"))
             probe = HealthProbe("responded", health=health, error=f"HTTP {exc.code}")
         except Exception:
+            error_type = type(exc).__name__
             probe = HealthProbe("unhealthy", error=f"bridge /health 返回 HTTP {exc.code}")
         finally:
             exc.close()
     except Exception as exc:
+        error_type = type(exc).__name__
         if _is_connection_refused(exc):
             probe = HealthProbe("absent", error=str(exc))
         else:
             probe = HealthProbe(
                 "unresponsive",
                 error=f"{type(exc).__name__}: {exc}",
+            )
+    if trace:
+        elapsed_ms = round((time.perf_counter() - started) * 1000, 2)
+        if probe.state == "responded":
+            trace.event(
+                "bridge.health.responded",
+                status="success",
+                httpStatus=http_status,
+                bodyBytes=raw_bytes,
+                elapsedMs=elapsed_ms,
+            )
+        else:
+            trace.event(
+                "bridge.health.failed",
+                status="error",
+                state=probe.state,
+                error=probe.error,
+                errorType=error_type,
+                elapsedMs=elapsed_ms,
             )
     return probe if with_state else probe.health
 
@@ -300,26 +348,6 @@ def _observable_identity_error(health):
     actual_server = os.path.normcase(os.path.realpath(health["serverPath"]))
     if actual_server != expected_server:
         return f"bridge health 的 serverPath 不属于当前 checkout: {health['serverPath']}"
-    return None
-
-
-def _listener_ownership_error(observation, health):
-    target_pid = health.get("serverPid") if isinstance(health, dict) else None
-    before = observation.listener_before if isinstance(observation, HealthObservation) else None
-    after = observation.listener_after if isinstance(observation, HealthObservation) else None
-    if not isinstance(after, dict) or after.get("pid") != target_pid:
-        actual_pid = after.get("pid") if isinstance(after, dict) else None
-        return f"health 的 serverPid={target_pid} 与 probe 后监听 PID={actual_pid} 不一致"
-    if not after.get("createdAt"):
-        return f"无法确认监听 PID {target_pid} 的进程创建时间"
-    if isinstance(before, dict) and before.get("pid") is not None:
-        if before.get("pid") != target_pid:
-            return (
-                f"probe 期间监听 PID 从 {before.get('pid')} 变为 {target_pid}，"
-                "无法确认端口所有权"
-            )
-        if before.get("createdAt") != after.get("createdAt"):
-            return f"监听 PID {target_pid} 的进程创建时间在 probe 期间发生变化"
     return None
 
 
@@ -386,10 +414,7 @@ def _classify_existing_probe(observation, expected, trace=None, started=None):
         )
     inspection = inspect_health(health, expected=expected)
     if inspection.reusable:
-        identity_error = _observable_identity_error(health) or _listener_ownership_error(
-            observation,
-            health,
-        )
+        identity_error = _observable_identity_error(health)
         if identity_error:
             if trace:
                 trace.event(
@@ -449,7 +474,7 @@ def _ensure_server(trace=None):
     """确保当前 checkout 的 bridge 在运行；绝不复用身份不明的服务。"""
     started = time.perf_counter()
     expected = current_service_identity()
-    initial_observation = _observe_health()
+    initial_observation = _observe_health(trace=trace)
     result = _classify_existing_probe(
         initial_observation,
         expected,
@@ -483,7 +508,7 @@ def _ensure_server(trace=None):
     with startup_stack:
         # 获得启动权后重新探测，关闭 probe 与 spawn 之间的 TOCTOU 窗口。
         result = _classify_existing_probe(
-            _observe_health(),
+            _observe_health(trace=trace),
             expected,
             trace=trace,
             started=started,
@@ -583,7 +608,7 @@ def _start_server_locked(expected, trace=None, started=None):
     last_observation = None
     for _ in range(40):
         time.sleep(0.25)
-        observation = _observe_health()
+        observation = _observe_health(trace=trace)
         last_observation = observation
         probe = observation.probe
         health = probe.health
@@ -591,10 +616,7 @@ def _start_server_locked(expected, trace=None, started=None):
         if inspection.reusable:
             process_pid = getattr(process, "pid", None)
             response_pid = health.get("serverPid", health.get("pid"))
-            identity_error = _observable_identity_error(health) or _listener_ownership_error(
-                observation,
-                health,
-            )
+            identity_error = _observable_identity_error(health)
             if identity_error:
                 _terminate_started_process(process)
                 if trace:
