@@ -162,6 +162,23 @@ class ActionTraceTests(unittest.TestCase):
             self.assertIn("过期日志清理失败", result["traceWarning"])
             self.assertTrue(trace.log_path.is_file())
 
+    def test_writable_directory_remains_usable_when_probe_delete_is_denied(self):
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(
+            os.environ,
+            {"WPS_TRACE_DIR": tmp},
+            clear=False,
+        ), patch.object(
+            Path,
+            "unlink",
+            side_effect=PermissionError("safe-delete denied"),
+        ):
+            trace = ActionTrace.start(component="call")
+            result = trace.decorate({"success": True})
+
+        self.assertTrue(result["success"])
+        self.assertIsNotNone(result["traceLog"])
+        self.assertNotIn("日志目录不可写", result.get("traceWarning", ""))
+
     def test_no_writable_directory_still_returns_stable_trace_fields(self):
         with patch.object(
             action_trace,

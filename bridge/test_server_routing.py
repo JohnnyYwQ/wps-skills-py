@@ -4,16 +4,23 @@ from pathlib import Path
 import sys
 import json
 import os
+import errno
 import tempfile
 import io
 import urllib.error
 import urllib.request
+from contextlib import nullcontext
 from unittest.mock import MagicMock
 from types import SimpleNamespace
 
 import server
 from action_trace import ActionTrace
-from service_lifecycle import BridgeLifecycle, current_service_identity
+from service_lifecycle import (
+    BridgeLifecycle,
+    ServiceStartResult,
+    build_service_identity,
+    current_service_identity,
+)
 
 SCRIPTS_DIR = Path(__file__).resolve().parents[1] / "scripts"
 sys.path.insert(0, str(SCRIPTS_DIR))
@@ -25,22 +32,36 @@ class _RecordingController:
         self.app = app
 
     def execute(self, action, params, trace=None):
+        self.action = action
+        self.params = params
+        if (self.app, action) == ("ppt", "saveAs"):
+            return {
+                "success": True,
+                "data": {"path": params["filePath"], "size": 1},
+            }
+        valid_data = {
+            ("word", "findReplace"): {"done": True},
+            ("word", "insertImage"): {"width": 100, "height": 100},
+            ("excel", "setCellValue"): {},
+        }
         return {
             "success": True,
-            "data": {
-                "routedApp": self.app,
-                "action": action,
-                "params": params,
-            },
+            "data": valid_data[(self.app, action)],
         }
 
 
 class ActionRoutingTests(unittest.TestCase):
     def _dispatch(self, action, params=None, app=None):
+        self.recording_controller = None
+
+        def controller_for(selected, trace=None):
+            self.recording_controller = _RecordingController(selected)
+            return self.recording_controller
+
         with patch.object(
             server,
             "get_app_controller",
-            side_effect=lambda selected, trace=None: _RecordingController(selected),
+            side_effect=controller_for,
         ):
             if app is None:
                 return server.dispatch(action, params or {})
@@ -54,7 +75,7 @@ class ActionRoutingTests(unittest.TestCase):
         )
 
         self.assertTrue(result["success"])
-        self.assertEqual("word", result["data"]["routedApp"])
+        self.assertEqual("word", self.recording_controller.app)
 
     def test_params_app_is_supported_but_not_forwarded_to_controller(self):
         result = self._dispatch(
@@ -63,8 +84,8 @@ class ActionRoutingTests(unittest.TestCase):
         )
 
         self.assertTrue(result["success"])
-        self.assertEqual("word", result["data"]["routedApp"])
-        self.assertNotIn("app", result["data"]["params"])
+        self.assertEqual("word", self.recording_controller.app)
+        self.assertNotIn("app", self.recording_controller.params)
 
     def test_ambiguous_action_without_app_fails_instead_of_guessing(self):
         result = self._dispatch("findReplace", {"find": "old", "replace": "new"})
@@ -74,10 +95,20 @@ class ActionRoutingTests(unittest.TestCase):
         self.assertEqual(["excel", "word"], result["supportedApps"])
 
     def test_unique_action_keeps_automatic_routing(self):
-        result = self._dispatch("setCellValue", {"cell": "A1", "value": 1})
+        result = self._dispatch(
+            "setCellValue", {"row": 1, "col": 1, "value": 1}
+        )
 
         self.assertTrue(result["success"])
-        self.assertEqual("excel", result["data"]["routedApp"])
+        self.assertEqual("excel", self.recording_controller.app)
+
+    def test_common_action_keeps_file_extension_routing(self):
+        result = self._dispatch(
+            "saveAs", {"filePath": "C:/tmp/report.pptx"}
+        )
+
+        self.assertTrue(result["success"])
+        self.assertEqual("ppt", self.recording_controller.app)
 
     def test_explicit_wrong_app_is_rejected_before_controller(self):
         result = self._dispatch("setCellValue", {"cell": "A1"}, app="word")
@@ -86,15 +117,85 @@ class ActionRoutingTests(unittest.TestCase):
         self.assertEqual("ACTION_NOT_SUPPORTED_FOR_APP", result["code"])
         self.assertEqual(["excel"], result["supportedApps"])
 
-    def test_server_actions_are_listed_once_as_common(self):
+    def test_invalid_params_are_rejected_before_controller_initialization(self):
+        with patch.object(server.sys, "platform", "win32"), patch.object(
+            server, "get_app_controller"
+        ) as get_controller:
+            result = server.dispatch(
+                "deleteSlide", {"slideIndex": "1"}, app="ppt"
+            )
+
+        self.assertFalse(result["success"])
+        self.assertEqual("INVALID_PARAMS", result["code"])
+        self.assertIn("params.slideIndex must be integer", result["error"])
+        get_controller.assert_not_called()
+
+    def test_unknown_parameter_is_rejected(self):
+        with patch.object(server.sys, "platform", "win32"), patch.object(
+            server, "get_app_controller"
+        ) as get_controller:
+            result = server.dispatch(
+                "addSlide", {"layout": "blank", "template": "extra"}, app="ppt"
+            )
+
+        self.assertEqual("INVALID_PARAMS", result["code"])
+        self.assertIn("params.template is not allowed", result["error"])
+        get_controller.assert_not_called()
+
+    def test_invalid_success_result_is_rejected(self):
+        controller = MagicMock()
+        controller.platform = "Windows"
+        controller.execute.return_value = {
+            "success": True,
+            "data": {"slideIndex": "one", "slideCount": 1},
+        }
+        with patch.object(server.sys, "platform", "win32"), patch.object(
+            server, "get_app_controller", return_value=controller
+        ):
+            result = server.dispatch("addSlide", {}, app="ppt")
+
+        self.assertFalse(result["success"])
+        self.assertEqual("INVALID_RESULT", result["code"])
+        self.assertIn("result.slideIndex must be number", result["error"])
+
+    def test_linux_backend_bypasses_windows_v1_contract_validation(self):
+        controller = MagicMock()
+        controller.platform = "Linux"
+        controller.execute.return_value = {
+            "success": True,
+            "data": {"cell": "A1", "value": 42},
+        }
+        with patch.object(server.sys, "platform", "linux"), patch.object(
+            server, "get_app_controller", return_value=controller
+        ):
+            result = server.dispatch(
+                "setCellValue", {"cell": "A1", "value": 42}, app="excel"
+            )
+
+        self.assertTrue(result["success"])
+        controller.execute.assert_called_once_with(
+            "setCellValue", {"cell": "A1", "value": 42}, trace=None
+        )
+
+    def test_server_actions_are_listed_once_as_bridge_contracts(self):
         actions = server.get_action_list()
 
         self.assertEqual(
-            [{"action": "ping", "app": "common"}],
+            [{
+                "owner": "bridge",
+                "action": "ping",
+                "description": "检查三个 Windows WPS COM 控制器的连通状态。",
+                "risk": "read",
+            }],
             [item for item in actions if item["action"] == "ping"],
         )
         self.assertEqual(
-            [{"action": "wireCheck", "app": "common"}],
+            [{
+                "owner": "bridge",
+                "action": "wireCheck",
+                "description": "检查三个 Windows WPS COM 控制器的连通状态。",
+                "risk": "read",
+            }],
             [item for item in actions if item["action"] == "wireCheck"],
         )
 
@@ -236,6 +337,15 @@ class CallArgumentTests(unittest.TestCase):
 
 
 class CallServiceLifecycleRegressionTests(unittest.TestCase):
+    def setUp(self):
+        listener_patcher = patch.object(
+            call,
+            "_listener_identity",
+            return_value={"pid": None, "createdAt": None},
+        )
+        listener_patcher.start()
+        self.addCleanup(listener_patcher.stop)
+
     def test_loopback_opener_does_not_inherit_environment_proxy(self):
         proxy_handlers = [
             handler
@@ -280,6 +390,282 @@ class CallServiceLifecycleRegressionTests(unittest.TestCase):
         self.assertFalse(result)
         self.assertEqual("BRIDGE_UNAVAILABLE", result.code)
         popen.assert_not_called()
+
+    def test_health_timeout_reports_listener_identity_before_and_after_probe(self):
+        probe = call.HealthProbe("unresponsive", error="timed out")
+        listener_before = {"pid": 111, "createdAt": "before-time"}
+        listener_after = {"pid": 111, "createdAt": "before-time"}
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(
+            os.environ,
+            {"WPS_TRACE_DIR": tmp},
+            clear=False,
+        ):
+            trace = ActionTrace.start(component="test")
+            with patch.object(call, "_health", return_value=probe), patch.object(
+                call,
+                "_listener_identity",
+                side_effect=[listener_before, listener_after],
+                create=True,
+            ), patch.object(call.subprocess, "Popen") as popen:
+                result = call._ensure_server(trace=trace)
+
+            events = [
+                json.loads(line)
+                for line in trace.log_path.read_text(encoding="utf-8").splitlines()
+            ]
+
+        unavailable = next(
+            row for row in events if row["event"] == "bridge.health.unavailable"
+        )
+        self.assertFalse(result)
+        self.assertEqual("unknown_owner", result.disposition)
+        self.assertEqual(listener_before, result.listener_before)
+        self.assertEqual(listener_after, result.listener_after)
+        self.assertEqual(listener_before, unavailable["listenerBefore"])
+        self.assertEqual(listener_after, unavailable["listenerAfter"])
+        popen.assert_not_called()
+
+    def test_listener_without_confirmed_health_is_unknown_and_never_replaced(self):
+        listener = {"pid": 222, "createdAt": "listener-start"}
+        with patch.object(
+            call,
+            "_health",
+            return_value=call.HealthProbe("absent", error="connection refused"),
+        ), patch.object(
+            call,
+            "_listener_identity",
+            return_value=listener,
+        ), patch.object(call.subprocess, "Popen") as popen:
+            result = call._ensure_server()
+
+        self.assertFalse(result)
+        self.assertEqual("unknown_owner", result.disposition)
+        self.assertEqual(listener, result.listener_before)
+        self.assertEqual(listener, result.listener_after)
+        popen.assert_not_called()
+
+    def test_current_checkout_health_without_launch_identity_is_unknown(self):
+        incomplete = {
+            "status": "ok",
+            **current_service_identity(instance_id="incomplete-instance"),
+        }
+        with patch.object(call, "_health", return_value=incomplete), patch.object(
+            call.subprocess,
+            "Popen",
+        ) as popen:
+            result = call._ensure_server()
+
+        self.assertFalse(result)
+        self.assertEqual("unknown_owner", result.disposition)
+        popen.assert_not_called()
+
+    def test_other_checkout_health_is_classified_as_foreign(self):
+        foreign_health = {
+            "status": "ok",
+            **build_service_identity(
+                "/workspace/other",
+                "foreign-code",
+                instance_id="foreign-instance",
+            ),
+        }
+        with patch.object(call, "_health", return_value=foreign_health), patch.object(
+            call.subprocess,
+            "Popen",
+        ) as popen:
+            result = call._ensure_server()
+
+        self.assertFalse(result)
+        self.assertEqual("foreign", result.disposition)
+        popen.assert_not_called()
+
+    def test_reuse_rejects_health_when_os_listener_identity_does_not_match(self):
+        health = {
+            "status": "ok",
+            **current_service_identity(instance_id="claimed-instance"),
+            "launchId": "claimed-launch",
+            "launchedByPid": 123,
+            "serverPath": call._server_path(),
+            "launchStartedAt": "2026-08-27T01:02:03.004Z",
+            "pid": 124,
+            "serverPid": 124,
+        }
+        wrong_listener = {"pid": 999, "createdAt": "other-process-time"}
+        with patch.object(call, "_health", return_value=health), patch.object(
+            call,
+            "_listener_identity",
+            return_value=wrong_listener,
+        ):
+            result = call._ensure_server()
+
+        self.assertFalse(result)
+        self.assertEqual("unknown_owner", result.disposition)
+        self.assertIn("监听 PID", result.error)
+
+    def test_start_winner_reprobes_inside_lock_and_reuses_ready_bridge(self):
+        ready_health = {
+            "status": "ok",
+            **current_service_identity(instance_id="winner-instance"),
+            "launchId": "winner-launch",
+            "launchedByPid": 123,
+            "serverPath": call._server_path(),
+            "launchStartedAt": "2026-08-27T01:02:03.004Z",
+            "pid": 124,
+            "serverPid": 124,
+        }
+        with patch.object(
+            call,
+            "_health",
+            side_effect=[None, ready_health],
+        ), patch.object(
+            call,
+            "_startup_lock",
+            return_value=nullcontext(),
+            create=True,
+        ), patch.object(
+            call,
+            "_listener_identity",
+            side_effect=[
+                {"pid": None, "createdAt": None},
+                {"pid": None, "createdAt": None},
+                {"pid": 124, "createdAt": "winner-time"},
+                {"pid": 124, "createdAt": "winner-time"},
+            ],
+        ), patch.object(call.subprocess, "Popen") as popen:
+            result = call._ensure_server()
+
+        self.assertTrue(result)
+        self.assertFalse(result.started)
+        self.assertEqual("reused", result.disposition)
+        self.assertEqual("winner-instance", result.health["instanceId"])
+        popen.assert_not_called()
+
+    def test_self_started_requires_health_to_match_launch_and_child_pid(self):
+        process = MagicMock()
+        process.pid = 456
+        process.poll.return_value = None
+        ready_health = {
+            "status": "ok",
+            **current_service_identity(instance_id="new-instance"),
+            "launchId": "launch-a",
+            "pid": 456,
+            "serverPid": 456,
+            "launchedByPid": os.getpid(),
+            "serverPath": call._server_path(),
+            "launchStartedAt": "2026-08-27T01:02:03.004Z",
+        }
+        with patch.object(
+            call,
+            "_health",
+            side_effect=[None, None, ready_health],
+        ), patch.object(call.os.path, "exists", return_value=True), patch.object(
+            call,
+            "server_log_path",
+            return_value=(None, None),
+        ), patch.object(
+            call.subprocess,
+            "Popen",
+            return_value=process,
+        ) as popen, patch.object(
+            call.uuid,
+            "uuid4",
+            return_value=SimpleNamespace(hex="launch-a"),
+            create=True,
+        ), patch.object(
+            call,
+            "utc_timestamp",
+            return_value="2026-08-27T01:02:03.004Z",
+        ), patch.object(
+            call,
+            "_listener_identity",
+            side_effect=[
+                {"pid": None, "createdAt": None},
+                {"pid": None, "createdAt": None},
+                {"pid": None, "createdAt": None},
+                {"pid": None, "createdAt": None},
+                {"pid": 456, "createdAt": "child-time"},
+                {"pid": 456, "createdAt": "child-time"},
+            ],
+        ), patch.object(call.time, "sleep"):
+            result = call._ensure_server()
+
+        self.assertTrue(result)
+        self.assertTrue(result.started)
+        self.assertEqual("self_started", result.disposition)
+        launch_environment = popen.call_args.kwargs["env"]
+        self.assertEqual("launch-a", launch_environment["WPS_BRIDGE_LAUNCH_ID"])
+        self.assertEqual(str(os.getpid()), launch_environment["WPS_BRIDGE_LAUNCHED_BY_PID"])
+        self.assertEqual("456", str(result.health["serverPid"]))
+
+    def test_spawn_response_with_incomplete_launch_identity_is_unknown(self):
+        process = MagicMock()
+        process.pid = 456
+        process.poll.return_value = None
+        incomplete_health = {
+            "status": "ok",
+            **current_service_identity(instance_id="new-instance"),
+            "launchId": "launch-a",
+            "pid": 456,
+            "serverPid": 456,
+        }
+        with patch.object(
+            call,
+            "_health",
+            side_effect=[None, None, incomplete_health],
+        ), patch.object(call.os.path, "exists", return_value=True), patch.object(
+            call,
+            "server_log_path",
+            return_value=(None, None),
+        ), patch.object(
+            call.subprocess,
+            "Popen",
+            return_value=process,
+        ), patch.object(
+            call.uuid,
+            "uuid4",
+            return_value=SimpleNamespace(hex="launch-a"),
+        ), patch.object(call.time, "sleep"):
+            result = call._ensure_server()
+
+        self.assertFalse(result)
+        self.assertEqual("unknown_owner", result.disposition)
+        process.terminate.assert_called_once_with()
+
+    def test_spawn_response_cannot_reuse_mismatched_launch_on_child_pid(self):
+        process = MagicMock()
+        process.pid = 456
+        process.poll.return_value = None
+        mismatched_health = {
+            "status": "ok",
+            **current_service_identity(instance_id="unexpected-instance"),
+            "launchId": "other-launch",
+            "pid": 456,
+            "serverPid": 456,
+            "launchedByPid": 999,
+            "serverPath": call._server_path(),
+            "launchStartedAt": "2026-08-27T00:00:00.000Z",
+        }
+        with patch.object(
+            call,
+            "_health",
+            side_effect=[None, None, mismatched_health],
+        ), patch.object(call.os.path, "exists", return_value=True), patch.object(
+            call,
+            "server_log_path",
+            return_value=(None, None),
+        ), patch.object(
+            call.subprocess,
+            "Popen",
+            return_value=process,
+        ), patch.object(
+            call.uuid,
+            "uuid4",
+            return_value=SimpleNamespace(hex="launch-a"),
+        ), patch.object(call.time, "sleep"):
+            result = call._ensure_server()
+
+        self.assertFalse(result)
+        self.assertEqual("unknown_owner", result.disposition)
+        process.terminate.assert_called_once_with()
 
     def test_non_object_health_is_rejected_without_trace_crash(self):
         with tempfile.TemporaryDirectory() as tmp, patch.dict(
@@ -368,14 +754,22 @@ class CallServiceLifecycleRegressionTests(unittest.TestCase):
         ready_health = {
             "status": "ok",
             **current_service_identity(instance_id="new-instance"),
+            "launchId": "windows-launch",
+            "pid": 789,
+            "serverPid": 789,
+            "launchedByPid": os.getpid(),
+            "serverPath": call._server_path(),
+            "launchStartedAt": "2026-08-27T01:02:03.004Z",
         }
         process = MagicMock()
+        process.pid = 789
+        process.poll.return_value = None
 
         class _StartupInfo:
             def __init__(self):
                 self.dwFlags = 0
 
-        with patch.object(call, "_health", side_effect=[None, ready_health]), patch.object(
+        with patch.object(call, "_health", side_effect=[None, None, ready_health]), patch.object(
             call,
             "current_service_identity",
             return_value=expected,
@@ -410,7 +804,26 @@ class CallServiceLifecycleRegressionTests(unittest.TestCase):
             call.subprocess,
             "Popen",
             return_value=process,
-        ) as popen, patch.object(call.time, "sleep"):
+        ) as popen, patch.object(
+            call.uuid,
+            "uuid4",
+            return_value=SimpleNamespace(hex="windows-launch"),
+        ), patch.object(
+            call,
+            "utc_timestamp",
+            return_value="2026-08-27T01:02:03.004Z",
+        ), patch.object(
+            call,
+            "_listener_identity",
+            side_effect=[
+                {"pid": None, "createdAt": None},
+                {"pid": None, "createdAt": None},
+                {"pid": None, "createdAt": None},
+                {"pid": None, "createdAt": None},
+                {"pid": 789, "createdAt": "child-time"},
+                {"pid": 789, "createdAt": "child-time"},
+            ],
+        ), patch.object(call.time, "sleep"):
             result = call._ensure_server()
 
         self.assertTrue(result)
@@ -420,6 +833,61 @@ class CallServiceLifecycleRegressionTests(unittest.TestCase):
         self.assertEqual(0x200, kwargs["creationflags"])
         self.assertEqual(0x01, kwargs["startupinfo"].dwFlags)
         self.assertNotIn("start_new_session", kwargs)
+
+    def test_windows_startup_lock_retries_until_winner_releases_it(self):
+        locking = MagicMock(
+            side_effect=[OSError(errno.EACCES, "locked"), None, None]
+        )
+        fake_msvcrt = SimpleNamespace(
+            LK_NBLCK=1,
+            LK_UNLCK=2,
+            locking=locking,
+        )
+
+        with patch.object(call.sys, "platform", "win32"), patch.dict(
+            sys.modules,
+            {"msvcrt": fake_msvcrt},
+        ), patch.object(call.time, "sleep") as sleep:
+            with call._startup_lock():
+                pass
+
+        self.assertEqual(1, locking.call_args_list[0].args[1])
+        sleep.assert_called_once_with(0.05)
+
+    def test_startup_lock_failure_is_reported_as_unknown_owner(self):
+        with patch.object(call, "_health", return_value=None), patch.object(
+            call,
+            "_startup_lock",
+            side_effect=OSError(errno.EACCES, "lock denied"),
+        ), patch.object(call.subprocess, "Popen") as popen:
+            result = call._ensure_server()
+
+        self.assertFalse(result)
+        self.assertEqual("BRIDGE_START_LOCK_FAILED", result.code)
+        self.assertEqual("unknown_owner", result.disposition)
+        popen.assert_not_called()
+
+    def test_call_output_exposes_bridge_ensure_disposition(self):
+        service = ServiceStartResult(
+            True,
+            health={"instanceId": "instance-a", "launchId": "launch-a", "serverPid": 321},
+            disposition="reused",
+        )
+        with patch.object(call, "_load_params_from_args", return_value=("ping", {}, None)), patch.object(
+            call,
+            "_ensure_server",
+            return_value=service,
+        ), patch.object(
+            call,
+            "_post",
+            return_value={"success": True},
+        ), patch("builtins.print") as output, self.assertRaises(SystemExit) as exit_result:
+            call.main()
+
+        self.assertEqual(0, exit_result.exception.code)
+        payload = json.loads(output.call_args.args[0])
+        self.assertEqual("reused", payload["bridgeEnsure"]["disposition"])
+        self.assertEqual("instance-a", payload["bridgeEnsure"]["instanceId"])
 
 
 class HttpTraceTests(unittest.TestCase):
@@ -434,7 +902,7 @@ class HttpTraceTests(unittest.TestCase):
                 {
                     "traceId": client_trace.trace_id,
                     "action": "setCellValue",
-                    "params": {"cell": "A1", "value": 1},
+                    "params": {"row": 1, "col": 1, "value": 1},
                 }
             ).encode("utf-8")
             handler = object.__new__(server.Handler)

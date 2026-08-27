@@ -8,11 +8,10 @@ WPS 统一桥接服务（HTTP）
   - ping / wireCheck 在 server 层聚合三应用连通性
 
 模型/用户通过 scripts/call.py 调用，无需直接发 HTTP。
-单线程 HTTPServer：底层 PowerShell 子进程是单 line 协议，多线程会交错写 stdin 导致协议崩。
+HTTP handler 有界并发；Action 仍严格串行进入 controller，避免 PowerShell 单行协议交错。
 """
 
 import json
-import re
 import sys
 import os
 import signal
@@ -20,6 +19,7 @@ import socket
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
+from socketserver import ThreadingMixIn
 from urllib.parse import urlparse
 
 # 把 bridge 目录加入导入路径
@@ -28,6 +28,13 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import wps_excel
 import wps_ppt
 import wps_word
+from action_catalog import (
+    ActionCatalog,
+    ActionManifestError,
+    ActionNotSupportedError,
+    ActionValidationError,
+    UnknownActionError,
+)
 from action_trace import ActionTrace
 from service_lifecycle import (
     BridgeLifecycle,
@@ -43,21 +50,14 @@ PORT = bridge_port()
 EXEC_TIMEOUT = 60
 MAX_REQUEST_BYTES = 16 * 1024 * 1024
 REQUEST_IO_TIMEOUT_SECONDS = 10
+MAX_HTTP_HANDLER_THREADS = 16
 
-# 从各控制器内嵌的 PS 脚本中解析出支持的 action 列表
-def _actions_from_module(mod):
-    return set(re.findall(r"function Exec-(\w+)\b", mod.PS_BRIDGE_SCRIPT))
-
-EXCEL_ACTIONS = _actions_from_module(wps_excel)
-PPT_ACTIONS = _actions_from_module(wps_ppt)
-WORD_ACTIONS = _actions_from_module(wps_word)
-
-# 通用 action：优先按显式 app 委派，其次按目标扩展名推断，最后兼容性回退 excel
-COMMON_ACTIONS = {
-    "save", "saveAs", "convertToPDF", "convertFormat",
-    "getSelectedText", "setSelectedText", "getAppInfo", "reconnect",
-}
-SERVER_ACTIONS = {"ping", "wireCheck"}
+try:
+    ACTION_CATALOG = ActionCatalog.from_path()
+    ACTION_MANIFEST_ERROR = None
+except ActionManifestError as exc:
+    ACTION_CATALOG = None
+    ACTION_MANIFEST_ERROR = exc
 
 def _infer_app_from_params(params):
     """从 filePath / outputPath / targetFormat 扩展名推断应用，避免 saveAs 无 app 时
@@ -81,12 +81,6 @@ APP_MODULES = {
     "excel": wps_excel,
     "ppt": wps_ppt,
     "word": wps_word,
-}
-
-APP_ACTIONS = {
-    "excel": EXCEL_ACTIONS,
-    "ppt": PPT_ACTIONS,
-    "word": WORD_ACTIONS,
 }
 
 APP_PROGIDS = {
@@ -125,7 +119,9 @@ def _normalize_app(app):
 
 
 def _supported_apps(action):
-    return [app for app, actions in APP_ACTIONS.items() if action in actions]
+    if ACTION_CATALOG is None:
+        return []
+    return [owner for owner in ACTION_CATALOG.owners_for(action) if owner in APP_MODULES]
 
 
 def route_action(action, params=None, requested_app=None):
@@ -152,28 +148,6 @@ def route_action(action, params=None, requested_app=None):
             APP_MODULES.keys(),
         )
 
-    if action in COMMON_ACTIONS:
-        if explicit_app:
-            return {
-                "app": explicit_app,
-                "source": "explicit",
-                "supportedApps": list(APP_MODULES),
-            }, None
-
-        inferred_app = _infer_app_from_params(params)
-        if inferred_app:
-            return {
-                "app": inferred_app,
-                "source": "file_extension",
-                "supportedApps": list(APP_MODULES),
-            }, None
-
-        return {
-            "app": "excel",
-            "source": "default",
-            "supportedApps": list(APP_MODULES),
-        }, None
-
     supported_apps = _supported_apps(action)
     if not supported_apps:
         return None, _route_error(
@@ -194,6 +168,22 @@ def route_action(action, params=None, requested_app=None):
             "supportedApps": supported_apps,
         }, None
 
+    inferred_app = _infer_app_from_params(params)
+    if inferred_app in supported_apps:
+        return {
+            "app": inferred_app,
+            "source": "file_extension",
+            "supportedApps": supported_apps,
+        }, None
+
+    default_app = ACTION_CATALOG.routing_default(action)
+    if default_app in supported_apps:
+        return {
+            "app": default_app,
+            "source": "default",
+            "supportedApps": supported_apps,
+        }, None
+
     if len(supported_apps) > 1:
         return None, _route_error(
             "AMBIGUOUS_ACTION",
@@ -208,16 +198,23 @@ def route_action(action, params=None, requested_app=None):
     }, None
 
 
-def dispatch(action, params, app=None, trace=None):
-    """统一派发入口"""
+def _prepare_dispatch(action, params, app=None, trace=None):
+    """无副作用地校验并路由 Action；不接触 controller。"""
     dispatch_started = time.perf_counter()
+    validate_windows_contract = sys.platform == "win32"
     if trace:
         trace.event("dispatch.started", action=action, requestedApp=app)
     if not action:
         result = {"success": False, "code": "MISSING_ACTION", "error": "缺少 action 参数"}
         if trace:
             trace.event("dispatch.rejected", status="error", code=result["code"], error=result["error"])
-        return result
+        return None, result
+
+    if ACTION_MANIFEST_ERROR is not None:
+        result = _route_error("INVALID_ACTION_MANIFEST", str(ACTION_MANIFEST_ERROR))
+        if trace:
+            trace.event("dispatch.rejected", status="error", code=result["code"], error=result["error"])
+        return None, result
 
     if params is None:
         params = {}
@@ -225,12 +222,28 @@ def dispatch(action, params, app=None, trace=None):
         result = _route_error("INVALID_PARAMS", "params 必须是 JSON object")
         if trace:
             trace.event("dispatch.rejected", status="error", code=result["code"], error=result["error"])
-        return result
+        return None, result
 
-    if action == "ping":
-        return handle_ping(trace=trace)
-    if action == "wireCheck":
-        return handle_ping(trace=trace)  # wireCheck 与 ping 同源：检测桥接线路
+    owners = ACTION_CATALOG.owners_for(action)
+    if owners == ["bridge"]:
+        action_params = dict(params)
+        action_params.pop("app", None)
+        if validate_windows_contract:
+            try:
+                ACTION_CATALOG.validate_params("bridge", action, action_params)
+            except ActionValidationError as exc:
+                result = _route_error("INVALID_PARAMS", str(exc))
+                if trace:
+                    trace.event("dispatch.rejected", status="error", code=result["code"], error=result["error"])
+                return None, result
+        return {
+            "action": action,
+            "params": action_params,
+            "requestedApp": app,
+            "route": {"app": "bridge", "source": "action_registry", "supportedApps": ["bridge"]},
+            "started": dispatch_started,
+            "validateWindowsContract": validate_windows_contract,
+        }, None
 
     route, route_error = route_action(action, params, requested_app=app)
     if route_error:
@@ -243,18 +256,62 @@ def dispatch(action, params, app=None, trace=None):
                 error=route_error.get("error"),
                 supportedApps=route_error.get("supportedApps"),
             )
-        return route_error
+        return None, route_error
 
-    selected_app = route["app"]
     if trace:
         trace.event(
             "route.selected",
             action=action,
-            app=selected_app,
+            app=route["app"],
             source=route["source"],
             supportedApps=route["supportedApps"],
         )
+    action_params = dict(params)
+    action_params.pop("app", None)
+    if validate_windows_contract:
+        try:
+            ACTION_CATALOG.validate_params(route["app"], action, action_params)
+        except ActionValidationError as exc:
+            result = _route_error("INVALID_PARAMS", str(exc))
+            if trace:
+                trace.event(
+                    "dispatch.rejected",
+                    status="error",
+                    action=action,
+                    app=route["app"],
+                    code=result["code"],
+                    error=result["error"],
+                )
+            return None, result
+    return {
+        "action": action,
+        "params": action_params,
+        "requestedApp": app,
+        "route": route,
+        "started": dispatch_started,
+        "validateWindowsContract": validate_windows_contract,
+    }, None
 
+
+def dispatch(action, params, app=None, trace=None, prepared=None):
+    """统一派发入口。prepared 仅供 HTTP handler 复用锁外校验结果。"""
+    if prepared is None:
+        prepared, rejection = _prepare_dispatch(action, params, app=app, trace=trace)
+        if rejection is not None:
+            return rejection
+
+    action = prepared["action"]
+    params = prepared["params"]
+    route = prepared["route"]
+    selected_app = route["app"]
+    if selected_app == "bridge":
+        result = handle_ping(trace=trace)
+        if prepared["validateWindowsContract"]:
+            try:
+                ACTION_CATALOG.validate_result("bridge", action, result.get("data", {}))
+            except ActionValidationError as exc:
+                return _route_error("INVALID_RESULT", str(exc))
+        return result
     controller_started = time.perf_counter()
     try:
         ctrl = get_app_controller(selected_app, trace=trace)
@@ -293,16 +350,27 @@ def dispatch(action, params, app=None, trace=None):
             elapsedMs=round((time.perf_counter() - controller_started) * 1000, 2),
         )
 
-    action_params = dict(params)
-    action_params.pop("app", None)
-
     execute_started = time.perf_counter()
     try:
-        result = ctrl.execute(action, action_params, trace=trace)
+        result = ctrl.execute(action, params, trace=trace)
         if not isinstance(result, dict):
             result = {"success": True, "data": result}
     except Exception as exc:
         result = {"success": False, "error": f"执行失败: {exc}"}
+
+    if (
+        result.get("success")
+        and prepared["validateWindowsContract"]
+        and platform_name == "Windows"
+    ):
+        try:
+            ACTION_CATALOG.validate_result(
+                selected_app,
+                action,
+                result.get("data", {}),
+            )
+        except ActionValidationError as exc:
+            result = _route_error("INVALID_RESULT", str(exc))
 
     if trace:
         trace.event(
@@ -313,7 +381,7 @@ def dispatch(action, params, app=None, trace=None):
             code=result.get("code"),
             error=result.get("error"),
             elapsedMs=round((time.perf_counter() - execute_started) * 1000, 2),
-            dispatchElapsedMs=round((time.perf_counter() - dispatch_started) * 1000, 2),
+            dispatchElapsedMs=round((time.perf_counter() - prepared["started"]) * 1000, 2),
             **trace.debug_fields(response=result),
         )
     return result
@@ -350,20 +418,10 @@ def handle_ping(trace=None):
     return result
 
 def get_action_list():
-    """返回全部可用 action 及其所属应用，供 /actions 与 SKILL.md 对齐"""
-    out = []
-    for a in sorted(EXCEL_ACTIONS):
-        if a not in COMMON_ACTIONS and a not in SERVER_ACTIONS:
-            out.append({"action": a, "app": "excel"})
-    for a in sorted(PPT_ACTIONS):
-        if a not in COMMON_ACTIONS and a not in SERVER_ACTIONS:
-            out.append({"action": a, "app": "ppt"})
-    for a in sorted(WORD_ACTIONS):
-        if a not in COMMON_ACTIONS and a not in SERVER_ACTIONS:
-            out.append({"action": a, "app": "word"})
-    for a in sorted(COMMON_ACTIONS | SERVER_ACTIONS):
-        out.append({"action": a, "app": "common"})
-    return out
+    """Return compact public contracts from the manifest-backed registry."""
+    if ACTION_MANIFEST_ERROR is not None:
+        raise ACTION_MANIFEST_ERROR
+    return ACTION_CATALOG.list()
 
 class Handler(BaseHTTPRequestHandler):
     def _send(self, obj, code=200):
@@ -379,8 +437,35 @@ class Handler(BaseHTTPRequestHandler):
         if parsed.path == "/health":
             self._send(self.server.lifecycle.health_snapshot())
         elif parsed.path == "/actions":
-            actions = get_action_list()
-            self._send({"actions": actions, "count": len(actions)})
+            try:
+                actions = get_action_list()
+                self._send({"actions": actions, "count": len(actions)})
+            except ActionManifestError as exc:
+                self._send({"success": False, "code": exc.code, "error": str(exc)}, 500)
+        elif parsed.path.startswith("/actions/"):
+            if ACTION_MANIFEST_ERROR is not None:
+                self._send({
+                    "success": False,
+                    "code": ACTION_MANIFEST_ERROR.code,
+                    "error": str(ACTION_MANIFEST_ERROR),
+                }, 500)
+                return
+            parts = parsed.path.strip("/").split("/")
+            if len(parts) != 3:
+                self._send({"success": False, "code": "UNKNOWN_ACTION", "error": "Action Contract 路径无效"}, 404)
+                return
+            _prefix, owner, action = parts
+            try:
+                self._send(ACTION_CATALOG.get(owner, action))
+            except ActionNotSupportedError as exc:
+                self._send({
+                    "success": False,
+                    "code": exc.code,
+                    "error": str(exc),
+                    "supportedApps": exc.supported_owners,
+                }, 404)
+            except UnknownActionError as exc:
+                self._send({"success": False, "code": exc.code, "error": str(exc)}, 404)
         else:
             self._send(
                 {
@@ -402,10 +487,7 @@ class Handler(BaseHTTPRequestHandler):
         if identity_error:
             self._send(identity_error[0], identity_error[1])
             return
-        try:
-            self._handle_dispatch()
-        finally:
-            self.server.lifecycle.mark_action_completed()
+        self._handle_dispatch()
 
     def _validate_instance_headers(self):
         lifecycle = self.server.lifecycle
@@ -443,12 +525,10 @@ class Handler(BaseHTTPRequestHandler):
             "status": "stopping",
             "instanceId": lifecycle.identity["instanceId"],
         }
-        try:
-            self._send(result, 202)
-        finally:
-            # 单线程 HTTPServer 不能在 handler 内调用 shutdown()；主循环会在
-            # 当前响应返回后观察到该标记并退出。
-            lifecycle.request_stop("api")
+        # 先切换为 stopping，再写 202，避免并发 dispatch 在响应写入窗口被接纳。
+        # 主循环随后停止接受新连接；server_close() 等待已启动的 handler 完成。
+        lifecycle.request_stop("api")
+        self._send(result, 202)
 
     def _handle_dispatch(self):
         request_started = time.perf_counter()
@@ -535,7 +615,35 @@ class Handler(BaseHTTPRequestHandler):
                 bodyTraceId=body_trace_id,
             )
 
-        result = dispatch(action, params, app=app, trace=trace)
+        prepared, rejection = _prepare_dispatch(action, params, app=app, trace=trace)
+        if rejection is not None:
+            trace.event(
+                "http.response.ready",
+                status="error",
+                action=action,
+                code=rejection.get("code"),
+                error=rejection.get("error"),
+                elapsedMs=round((time.perf_counter() - request_started) * 1000, 2),
+            )
+            self._send(trace.decorate(rejection))
+            return
+
+        lifecycle = self.server.lifecycle
+        with lifecycle.action_execution(action, trace.trace_id) as admitted:
+            if not admitted:
+                self._send(trace.decorate({
+                    "success": False,
+                    "code": "BRIDGE_SHUTTING_DOWN",
+                    "error": "bridge 正在关闭，请稍后重试",
+                }), 503)
+                return
+            result = dispatch(
+                action,
+                params,
+                app=app,
+                trace=trace,
+                prepared=prepared,
+            )
         trace.event(
             "http.response.ready",
             status="success" if result.get("success") else "error",
@@ -550,14 +658,40 @@ class Handler(BaseHTTPRequestHandler):
         pass  # 静默
 
 
-class BridgeHTTPServer(HTTPServer):
+class BridgeHTTPServer(ThreadingMixIn, HTTPServer):
+    daemon_threads = False
+    block_on_close = True
+
     # Windows 的 SO_REUSEADDR 可能允许第二监听者抢占相同端口；Unix 保留
     # reuse 以避免服务正常重启被 TIME_WAIT 阻断。
     allow_reuse_address = os.name != "nt"
 
-    def __init__(self, server_address, handler_class, lifecycle):
+    def __init__(
+        self,
+        server_address,
+        handler_class,
+        lifecycle,
+        max_handler_threads=MAX_HTTP_HANDLER_THREADS,
+    ):
         self.lifecycle = lifecycle
+        self._handler_slots = threading.BoundedSemaphore(max_handler_threads)
         super().__init__(server_address, handler_class)
+
+    def process_request(self, request, client_address):
+        if not self._handler_slots.acquire(blocking=False):
+            self.shutdown_request(request)
+            return
+        try:
+            super().process_request(request, client_address)
+        except Exception:
+            self._handler_slots.release()
+            raise
+
+    def process_request_thread(self, request, client_address):
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self._handler_slots.release()
 
     def server_bind(self):
         if os.name == "nt":
@@ -574,7 +708,7 @@ class BridgeHTTPServer(HTTPServer):
 
 
 def serve_until_stopped(httpd, lifecycle, poll_interval=0.25):
-    """单线程请求循环；Action 执行期间不会并发触发 idle shutdown。"""
+    """接受请求直至停止；handler 并发，Action 生命周期由 lifecycle 串行协调。"""
     httpd.timeout = poll_interval
     while not lifecycle.should_stop():
         httpd.handle_request()
@@ -631,7 +765,14 @@ def main():
     server = BridgeHTTPServer((HOST, PORT), Handler, lifecycle)
     previous_handlers = _install_signal_handlers(lifecycle)
     print(f"WPS 统一桥接服务已启动: http://{HOST}:{PORT}", flush=True)
-    print(f"  支持 action: Excel {len(EXCEL_ACTIONS)} + PPT {len(PPT_ACTIONS)} + Word {len(WORD_ACTIONS)}", flush=True)
+    counts = {
+        owner: len(ACTION_CATALOG.list(owner=owner))
+        for owner in ("excel", "ppt", "word")
+    }
+    print(
+        f"  支持 contract: Excel {counts['excel']} + PPT {counts['ppt']} + Word {counts['word']}",
+        flush=True,
+    )
     print(
         f"  PID: {os.getpid()} | instance: {lifecycle.identity['instanceId']}"
         f" | idle timeout: {lifecycle.idle_timeout_seconds:g}s",

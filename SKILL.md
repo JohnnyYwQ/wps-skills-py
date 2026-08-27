@@ -8,7 +8,7 @@ disable: false
 
 你现在是 **WPS Office 统一智能助手**，能够统一管理和操控 Excel（表格）、Word（文字）、PPT（演示）三大应用。当用户的需求涉及其中任一应用，或需要跨应用操作时，你通过本地桥接服务调用对应的 WPS action 完成任务。
 
-> **架构与约束**：本 Skill 通过本地桥接服务与 WPS Office 通信，**不依赖 MCP，不依赖任何外网，不依赖 Node.js/JS 环境，无需 pip 安装**。所有 action 由本地 `bridge/server.py`（HTTP 服务）调度，双平台后端：**Windows** 走 PowerShell COM 直接操控运行中的 WPS（233 个 action 真机验证）；**Linux** 走文件级 OpenXML 后端（同一套 action 契约，直接读写 .xlsx/.pptx/.docx 文件）。支持 Windows / Linux（x86 + ARM），macOS 不支持。
+> **架构与约束**：本 Skill 通过本地桥接服务与 WPS Office 通信，**不依赖 MCP，不依赖任何外网，不依赖 Node.js/JS 环境，无需 pip 安装**。所有 action 由本地 `bridge/server.py`（HTTP 服务）调度。v1 严格 Action Contract 仅以 **Windows PowerShell COM** 实机行为为基线；Linux OpenXML 文件后端后续对齐，不参与或阻塞 v1 Schema。macOS 不支持。
 
 ## 一、调用方式（核心）
 
@@ -18,25 +18,14 @@ disable: false
 # 语法
 python scripts/call.py <action> [--app excel|ppt|word] '<json参数>'
 
-# Excel 示例
-python scripts/call.py getContext '{}'
-python scripts/call.py setFormula '{"cell":"D2","formula":"=VLOOKUP(A2,$A$2:$B$100,2,FALSE)"}'
-python scripts/call.py createChart '{"chartType":"column","dataRange":"A1:B10","title":"销量"}'
+# 1. 搜索候选 Action
+python scripts/actions.py search chart
 
-# PPT 示例
-python scripts/call.py createPresentation '{}'
-python scripts/call.py addSlide '{"layout":"title_content","title":"项目进度"}'
-python scripts/call.py addTextBox '{"slideIndex":1,"text":"关键指标","x":100,"y":200,"width":300,"height":50}'
+# 2. 读取目标 Action 的完整参数与结果 Contract
+python scripts/actions.py describe createChart --app excel
 
-# Word 示例
-python scripts/call.py createDocument '{}'
-python scripts/call.py openDocument '{"filePath":"C:/Users/me/报告.docx"}'
-python scripts/call.py setFont '{"font_name":"微软雅黑","font_size":14,"bold":true,"range":"all"}'
-python scripts/call.py findReplace --app word '{"find_text":"公司","replace_text":"集团","replace_all":true}'
-
-# 通用操作（按 app 委派）
-python scripts/call.py save '{"app":"ppt"}'
-python scripts/call.py convertToPDF '{"app":"word","outputPath":"C:/out/报告.pdf"}'
+# 3. 按 Contract 准备 JSON 参数后调用
+python scripts/call.py createChart --app excel --params-file C:/tmp/chart.json
 ```
 
 > **⚠️ PowerShell 5.1 调用须知（避免 JSON 引号转义失败）**
@@ -52,6 +41,8 @@ python scripts/call.py convertToPDF '{"app":"word","outputPath":"C:/out/报告.p
 > ```
 > `--app` 是独立的路由参数，不会传入 Action 参数。唯一 Action 可省略；`findReplace`、`insertImage` 等重名 Action 必须指定，例如 `python scripts/call.py insertImage --app ppt --params-file C:/tmp/image.json`。
 > **不要绕过 `call.py` 直接 POST `/dispatch`。** bridge 会校验 checkout、代码指纹和随机实例 ID；原始 HTTP 请求缺少实例身份头会被拒绝。这可以防止端口被旧服务或另一份 Skill 占用时把命令发送到错误进程。
+
+每次选择 Action 后都必须读取 Catalog Contract；`SKILL.md` 不维护精确参数表。`INVALID_PARAMS` 表示输入在 controller/COM 前被拒绝，`INVALID_RESULT` 表示 Windows backend 的成功数据违反公开结果 Contract。不得通过字符串转数字、真假值转换或丢弃未知字段绕过错误。
 
 响应统一为 JSON，并且无论成功或失败都带本次 Action 的 `traceId` 和实际日志路径 `traceLog`：
 
@@ -144,7 +135,7 @@ server.py（统一路由：按 action 名派发到 excel/ppt/word 控制器）
 
 ## 二点五、Linux 平台支持（文件级自动化）
 
-Linux 上 WPS 无 COM/UNO 等自动化接口，本 Skill 采用**文件级后端**：与 Windows 完全同一套 action 名与参数，底层直接读写 OpenXML 文件（生成的文件已在 Windows WPS 中实测打开验证）。
+Linux 上 WPS 无 COM/UNO 等自动化接口，本 Skill 采用**文件级后端**并沿用部分 Windows action 名，底层直接读写 OpenXML 文件（生成的文件已在 Windows WPS 中实测打开验证）。Linux 参数与结果尚未纳入 v1 严格 Contract；不支持或尚未对齐的 Action 必须明确报错。
 
 | 应用 | 后端 | 实现 action 数 | 说明 |
 |------|------|--------------|------|
@@ -179,60 +170,22 @@ Linux 使用要点：
 python scripts/call.py findReplace --app word --params-file C:/tmp/replace.json
 ```
 
-## 四、Excel 专项 action（约 75 个）
+## 四、Action Catalog 与高风险边界
 
-| 分类 | 关键 action |
-|------|------------|
-| 工作簿/表 | openWorkbook, createWorkbook, closeWorkbook, switchWorkbook, getContext, getActiveWorkbook, getSheetList |
-| 单元格 | getCellValue, setCellValue, getFormula, setFormula, clearRange, getCellComments |
-| 数据 | getRangeData, setRangeData, cleanData, sortRange, findReplace, copyRange, pasteRange, fillSeries |
-| 图表/透视 | createChart, updateChart, exportChartAsImage, createPivotTable, updatePivotTable |
-| 行列/工作表 | insertRows, deleteRows, insertColumns, hideColumns, showColumns, createSheet, renameSheet, deleteSheet |
-| 格式 | setCellFormat, setBorder, mergeCells, setColumnWidth, setRowHeight, protectSheet |
+`bridge/action_manifest.json` 是 Windows 公开 Action Contract、路由注册和 Schema 查询的唯一事实源。不要维护或依赖第二份手工 Action 清单。
 
-> 注意：`createPivotTable` 在 WPS 上的 `PivotCaches` COM 行为与 Excel VBA 不一致（报"值不在预期范围内"），属 WPS 特有 API 限制，待专门攻关。
+```bash
+python scripts/actions.py list
+python scripts/actions.py list --app ppt
+python scripts/actions.py search chart
+python scripts/actions.py describe addSlide --app ppt
+```
 
-## 五、PPT 专项 action（约 120 个）
-
-| 分类 | 关键 action |
-|------|------------|
-| 演示文稿 | createPresentation, openPresentation, closePresentation, getOpenPresentations, switchPresentation, insertSlidesFromFile |
-| 幻灯片 | addSlide, deleteSlide, duplicateSlide, moveSlide, getSlideCount, getSlideInfo, switchSlide, setSlideLayout, setSlideTitle, setSlideContent, setSlideBackground |
-| 文本框 | addTextBox, deleteTextBox, getTextBoxes, setTextBoxText, setTextBoxStyle, create3DText |
-| 形状 | addShape, deleteShape, getShapes, setShapePosition, setShapeStyle, setShapeFill, setShapeBorder, alignShapes, groupShapes, setShapeZOrder |
-| 图片/表格 | insertPptImage, deletePptImage, exportSlideAsImage, replacePptImage, insertPptTable, setPptTableCell |
-| 美化/动画 | beautifySlide, unifyFont, applyColorScheme, addAnimation, setSlideTransition, applyTransitionToAll |
-| 图表/可视化 | insertPptChart, createFlowChart, createOrgChart, createProgressBar, createGauge, createKpiCards, createTimeline |
-
-> 标注 `best-effort` 的复合 action（如 beautifySlide / createKpiCards / 3D 类）用 WPS 基础 COM 原语实现，建议跨应用场景优先用"模板 + 原位替换 + 整页搬运"而非整页重画，以保留版式。
-
-> **🟡 PPT 自定义排版建议（版式占位符冲突）**
-> `title` / `title_content` 版式自带占位符，会与自定义形状/文本框位置冲突。需要精确定位搭建演示文稿时，**优先用 `addSlide` 的 `layout:"blank"`（空白版式）从零绘制**，再用 `addTextBox` / `addShape` 摆放；`title_content` 仅用于快速标准页。若要在已有版式上改标题，用 `setSlideTitle` / `setSlideSubtitle`（按占位符位置，非 shapeId）。
-
-## 六、Word 专项 action（约 24 个）
-
-| 分类 | 关键 action |
-|------|------------|
-| 文档管理 | createDocument, getActiveDocument, getOpenDocuments, switchDocument, openDocument, getDocumentText |
-| 格式化 | setFont, applyStyle, setTextColor, setLineSpacing, setParagraph, setPageSetup |
-| 内容 | insertText, findReplace, insertTable, insertImage, addComment, insertPageBreak, insertBookmark, insertSectionBreak |
-| 页眉页脚/目录 | insertHeader, insertFooter, generateTOC |
-| 模板填写 | getDocumentParagraphs, findInDocument, smartFillField, replaceBookmarkContent |
-
-## 七、通用 action（10 个；应用级 Action 按 app 委派）
-
-| action | 参数 | 说明 |
-|--------|------|------|
-| `save` | `app` | 保存当前文档 |
-| `saveAs` | `app`, `filePath` | 另存为 |
-| `convertToPDF` | `app`, `outputPath?` | 导出 PDF |
-| `convertFormat` | `app`, `targetFormat`, `outputPath?` | 格式互转 |
-| `getSelectedText` | `app` | 获取选中文本 |
-| `setSelectedText` | `app`, `text` | 替换选中文本 |
-| `getAppInfo` | `app` | 获取 WPS 版本信息 |
-| `reconnect` | `app` | **重连/复位指定应用的 COM 桥接**（COM 异常后手动恢复用，自动重试失败时使用） |
-| `ping` | — | 检测三应用连通性 |
-| `wireCheck` | — | 检测桥接线路状态 |
+- 唯一归属 Action 可自动路由；重名 Action 的 `describe` 或调用缺少 app 时必须返回候选 owner，不能猜测。
+- `save`、`saveAs`、格式转换等跨应用重名 Action 建议始终显式传 `--app`；文件扩展名推断只用于兼容旧调用。
+- 删除、覆盖、批量替换、格式转换前检查 Contract 的 `risk` 和 `prerequisites`，必要时先备份。
+- PPT 创建类 Action 返回的 `shapeId` 是后续按形状操作 Contract 中的 `shapeIndex`，它不是位置序号。
+- `best-effort` 复合 Action 可能受 WPS COM 能力限制；优先使用可验证的基础 Action 分步完成。
 
 ## 八、错误处理与注意事项
 
@@ -245,15 +198,17 @@ python scripts/call.py findReplace --app word --params-file C:/tmp/replace.json
 - **跨应用确认**：跨应用操作前确认数据来源与目标。
 - **批量谨慎**：批量操作前建议备份，确认覆盖。
 - **bridge 身份冲突**：`BRIDGE_INSTANCE_MISMATCH` 表示端口上是旧版、旧代码或另一 checkout；不要继续直发 HTTP。先运行 `service.py status`，只对确认安全的当前 checkout 使用 `restart`。
-- **bridge 暂时无响应**：`BRIDGE_UNAVAILABLE` 不等于服务未启动，通常是单线程 bridge 正在执行另一个长 Action。不得尝试重复启动或强杀；等待该 Action 完成后重试 `service.py status`/原 Action。
+- **bridge 暂时无响应**：`BRIDGE_UNAVAILABLE` 不等于服务未启动。bridge 正常会在 Action 执行期间并发响应 health；持续无响应应结合监听 PID、health `state` 和 trace 排查 handler 饱和、进程卡住或本机网络异常。不得尝试重复启动或强杀未知进程。
 - **任务结束**：保存并验证产物后必须运行 `python scripts/service.py stop`，不要把 HTTP/PowerShell 服务留在后台。
 
-## 九、可用 action 列表查询
+## 九、Action Contract 查询
 
+```text
+GET /actions
+GET /actions/ppt/addSlide
 ```
-GET http://127.0.0.1:58891/actions
-```
-返回全部 action 及其所属应用（excel/ppt/word/common），与本文档对应。
+
+列表返回 owner、action、description、risk 摘要，单项返回完整参数/结果 Contract。离线优先使用 `scripts/actions.py`，它不启动 WPS 或 bridge。
 
 ## 十、自检与测试
 
@@ -268,7 +223,7 @@ python scripts/test.py
 python scripts/test_functional.py
 
 # 4. Action trace / 路由 / 控制器 / 生命周期单元测试（不需要 Windows/WPS）
-PYTHONPATH=bridge python -m unittest bridge/test_action_trace.py bridge/test_server_routing.py bridge/test_controller_trace.py bridge/test_service_lifecycle.py bridge/test_server_lifecycle.py bridge/test_service_cli.py
+PYTHONPATH=bridge python -m unittest bridge/test_action_manifest.py bridge/test_action_catalog.py bridge/test_action_trace.py bridge/test_server_routing.py bridge/test_controller_trace.py bridge/test_service_lifecycle.py bridge/test_server_lifecycle.py bridge/test_service_cli.py
 ```
 
 ---

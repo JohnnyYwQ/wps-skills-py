@@ -16,13 +16,17 @@ WPS 统一 Skill 调用入口（胶水层）
 """
 
 from dataclasses import dataclass
+from contextlib import ExitStack, contextmanager
 import errno
 import sys
 import os
 import json
+import re
 import socket
+import tempfile
 import time
 import subprocess
+import uuid
 import urllib.request
 import urllib.error
 
@@ -37,6 +41,7 @@ from service_lifecycle import (
     bridge_port,
     current_service_identity,
     inspect_health,
+    utc_timestamp,
 )
 
 
@@ -44,6 +49,7 @@ HOST = bridge_host()
 PORT = bridge_port()
 BASE = f"http://{HOST}:{PORT}"
 _LOOPBACK_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+_DIAGNOSTIC_POPEN = subprocess.Popen
 
 
 def _urlopen(request, timeout):
@@ -58,6 +64,13 @@ class HealthProbe:
     error: str = None
 
 
+@dataclass(frozen=True)
+class HealthObservation:
+    probe: HealthProbe
+    listener_before: object = None
+    listener_after: object = None
+
+
 def _as_health_probe(value):
     """兼容测试/旧内部调用传入的 dict/None。"""
     if isinstance(value, HealthProbe):
@@ -65,6 +78,76 @@ def _as_health_probe(value):
     if value is None:
         return HealthProbe("absent")
     return HealthProbe("responded", health=value)
+
+
+def _process_created_at(pid):
+    if not pid:
+        return None
+    try:
+        if sys.platform == "win32":
+            stdout = _run_diagnostic(
+                [
+                    "powershell.exe",
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-Command",
+                    f"(Get-CimInstance Win32_Process -Filter 'ProcessId = {int(pid)}').CreationDate",
+                ],
+            )
+        else:
+            stdout = _run_diagnostic(["ps", "-p", str(int(pid)), "-o", "lstart="])
+        created_at = stdout.strip()
+        return created_at or None
+    except Exception:
+        return None
+
+
+def _listener_identity():
+    """Best-effort identity of the process listening on the bridge port."""
+    try:
+        if sys.platform == "win32":
+            stdout = _run_diagnostic(["netstat", "-ano", "-p", "tcp"])
+            pattern = re.compile(
+                rf"^\s*TCP\s+{re.escape(HOST)}:{PORT}\s+\S+\s+LISTENING\s+(\d+)\s*$",
+                re.IGNORECASE | re.MULTILINE,
+            )
+            match = pattern.search(stdout)
+            pid = int(match.group(1)) if match else None
+        else:
+            stdout = _run_diagnostic(
+                ["lsof", "-nP", "-a", f"-iTCP:{PORT}", "-sTCP:LISTEN", "-Fp"]
+            )
+            match = re.search(r"^p(\d+)$", stdout, re.MULTILINE)
+            pid = int(match.group(1)) if match else None
+        return {"pid": pid, "createdAt": _process_created_at(pid)}
+    except Exception as exc:
+        return {
+            "pid": None,
+            "createdAt": None,
+            "inspectionError": f"{type(exc).__name__}: {exc}",
+        }
+
+
+def _run_diagnostic(command, timeout=2):
+    process = _DIAGNOSTIC_POPEN(
+        command,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        stdout, _ = process.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        stdout, _ = process.communicate()
+    return stdout or ""
+
+
+def _observe_health():
+    listener_before = _listener_identity()
+    probe = _as_health_probe(_health(with_state=True))
+    listener_after = _listener_identity()
+    return HealthObservation(probe, listener_before, listener_after)
 
 
 def _is_connection_refused(exc):
@@ -89,6 +172,55 @@ def _project_root():
 
 def _server_path():
     return os.path.join(_project_root(), "bridge", "server.py")
+
+
+@contextmanager
+def _startup_lock():
+    """Serialize bridge discovery and startup across independent callers."""
+    safe_host = HOST.replace(":", "_").replace(".", "_")
+    lock_path = os.path.join(
+        tempfile.gettempdir(),
+        f"wps-skills-bridge-{safe_host}-{PORT}.lock",
+    )
+    lock_file = open(lock_path, "a+b")
+    locked = False
+    try:
+        if sys.platform == "win32":
+            import msvcrt
+
+            lock_file.seek(0, os.SEEK_END)
+            if lock_file.tell() == 0:
+                lock_file.write(b"\0")
+                lock_file.flush()
+            lock_file.seek(0)
+            while True:
+                try:
+                    msvcrt.locking(lock_file.fileno(), msvcrt.LK_NBLCK, 1)
+                    break
+                except OSError as exc:
+                    if exc.errno not in (errno.EACCES, errno.EAGAIN, errno.EDEADLK):
+                        raise
+                    time.sleep(0.05)
+        else:
+            import fcntl
+
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        locked = True
+        yield
+    finally:
+        try:
+            if locked:
+                lock_file.seek(0)
+                if sys.platform == "win32":
+                    import msvcrt
+
+                    msvcrt.locking(lock_file.fileno(), msvcrt.LK_UNLCK, 1)
+                else:
+                    import fcntl
+
+                    fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+        finally:
+            lock_file.close()
 
 
 def _health(with_state=False):
@@ -151,12 +283,83 @@ def _terminate_started_process(process, wait_seconds=3):
         pass
 
 
-def _ensure_server(trace=None):
-    """确保当前 checkout 的 bridge 在运行；绝不复用身份不明的服务。"""
-    started = time.perf_counter()
-    expected = current_service_identity()
-    probe = _as_health_probe(_health(with_state=True))
+def _observable_identity_error(health):
+    if not isinstance(health, dict):
+        return "bridge health 缺少可观察的启动身份"
+    positive_pid_fields = ("pid", "serverPid", "launchedByPid")
+    for field in positive_pid_fields:
+        value = health.get(field)
+        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            return f"bridge health 缺少有效的 {field}"
+    if health["pid"] != health["serverPid"]:
+        return "bridge health 的 pid 与 serverPid 不一致"
+    for field in ("launchId", "serverPath", "launchStartedAt"):
+        if not isinstance(health.get(field), str) or not health[field].strip():
+            return f"bridge health 缺少有效的 {field}"
+    expected_server = os.path.normcase(os.path.realpath(_server_path()))
+    actual_server = os.path.normcase(os.path.realpath(health["serverPath"]))
+    if actual_server != expected_server:
+        return f"bridge health 的 serverPath 不属于当前 checkout: {health['serverPath']}"
+    return None
+
+
+def _listener_ownership_error(observation, health):
+    target_pid = health.get("serverPid") if isinstance(health, dict) else None
+    before = observation.listener_before if isinstance(observation, HealthObservation) else None
+    after = observation.listener_after if isinstance(observation, HealthObservation) else None
+    if not isinstance(after, dict) or after.get("pid") != target_pid:
+        actual_pid = after.get("pid") if isinstance(after, dict) else None
+        return f"health 的 serverPid={target_pid} 与 probe 后监听 PID={actual_pid} 不一致"
+    if not after.get("createdAt"):
+        return f"无法确认监听 PID {target_pid} 的进程创建时间"
+    if isinstance(before, dict) and before.get("pid") is not None:
+        if before.get("pid") != target_pid:
+            return (
+                f"probe 期间监听 PID 从 {before.get('pid')} 变为 {target_pid}，"
+                "无法确认端口所有权"
+            )
+        if before.get("createdAt") != after.get("createdAt"):
+            return f"监听 PID {target_pid} 的进程创建时间在 probe 期间发生变化"
+    return None
+
+
+def _classify_existing_probe(observation, expected, trace=None, started=None):
+    """Return a terminal result, or None when the port is confirmed absent."""
+    if isinstance(observation, HealthObservation):
+        probe = observation.probe
+        listener_before = observation.listener_before
+        listener_after = observation.listener_after
+    else:
+        probe = _as_health_probe(observation)
+        listener_before = None
+        listener_after = None
     health = probe.health
+    listener_was_present = any(
+        isinstance(snapshot, dict) and snapshot.get("pid")
+        for snapshot in (listener_before, listener_after)
+    )
+    if probe.state == "absent" and listener_was_present:
+        error = (
+            "health probe 未确认 bridge，但探测前后发现端口监听者；"
+            "为避免双开，拒绝启动第二实例"
+        )
+        if trace:
+            trace.event(
+                "bridge.health.unavailable",
+                status="error",
+                state="unknown_owner",
+                error=error,
+                listenerBefore=listener_before,
+                listenerAfter=listener_after,
+            )
+        return ServiceStartResult(
+            False,
+            code="BRIDGE_UNAVAILABLE",
+            error=error,
+            disposition="unknown_owner",
+            listener_before=listener_before,
+            listener_after=listener_after,
+        )
     if probe.state in ("unresponsive", "unhealthy"):
         error = (
             "bridge 端口存在但健康检查无响应，可能正在执行 Action 或已卡住；"
@@ -170,18 +373,54 @@ def _ensure_server(trace=None):
                 status="error",
                 state=probe.state,
                 error=error,
+                listenerBefore=listener_before,
+                listenerAfter=listener_after,
             )
-        return ServiceStartResult(False, code="BRIDGE_UNAVAILABLE", error=error)
+        return ServiceStartResult(
+            False,
+            code="BRIDGE_UNAVAILABLE",
+            error=error,
+            disposition="unknown_owner",
+            listener_before=listener_before,
+            listener_after=listener_after,
+        )
     inspection = inspect_health(health, expected=expected)
     if inspection.reusable:
+        identity_error = _observable_identity_error(health) or _listener_ownership_error(
+            observation,
+            health,
+        )
+        if identity_error:
+            if trace:
+                trace.event(
+                    "bridge.instance.rejected",
+                    status="error",
+                    state="unknown_owner",
+                    error=identity_error,
+                    listenerBefore=listener_before,
+                    listenerAfter=listener_after,
+                )
+            return ServiceStartResult(
+                False,
+                code="BRIDGE_INSTANCE_MISMATCH",
+                error=identity_error,
+                health=health,
+                disposition="unknown_owner",
+                listener_before=listener_before,
+                listener_after=listener_after,
+            )
         if trace:
             trace.event(
                 "bridge.health.checked",
                 status="healthy",
                 instanceId=health.get("instanceId"),
-                elapsedMs=round((time.perf_counter() - started) * 1000, 2),
+                elapsedMs=(
+                    round((time.perf_counter() - started) * 1000, 2)
+                    if started is not None
+                    else None
+                ),
             )
-        return ServiceStartResult(True, health=health)
+        return ServiceStartResult(True, health=health, disposition="reused")
     if probe.state == "responded":
         inspection_error = inspection.error
         if health is None:
@@ -201,7 +440,64 @@ def _ensure_server(trace=None):
             code="BRIDGE_INSTANCE_MISMATCH",
             error=inspection_error,
             health=health if isinstance(health, dict) else None,
+            disposition=("foreign" if inspection.state == "foreign" else "unknown_owner"),
         )
+    return None
+
+
+def _ensure_server(trace=None):
+    """确保当前 checkout 的 bridge 在运行；绝不复用身份不明的服务。"""
+    started = time.perf_counter()
+    expected = current_service_identity()
+    initial_observation = _observe_health()
+    result = _classify_existing_probe(
+        initial_observation,
+        expected,
+        trace=trace,
+        started=started,
+    )
+    if result is not None:
+        return result
+
+    startup_stack = ExitStack()
+    try:
+        startup_stack.enter_context(_startup_lock())
+    except Exception as exc:
+        error = f"无法获得 bridge 跨进程启动锁: {type(exc).__name__}: {exc}"
+        if trace:
+            trace.event(
+                "bridge.start.lock_failed",
+                status="error",
+                error=error,
+                listenerBefore=initial_observation.listener_before,
+                listenerAfter=initial_observation.listener_after,
+            )
+        return ServiceStartResult(
+            False,
+            code="BRIDGE_START_LOCK_FAILED",
+            error=error,
+            disposition="unknown_owner",
+            listener_before=initial_observation.listener_before,
+            listener_after=initial_observation.listener_after,
+        )
+    with startup_stack:
+        # 获得启动权后重新探测，关闭 probe 与 spawn 之间的 TOCTOU 窗口。
+        result = _classify_existing_probe(
+            _observe_health(),
+            expected,
+            trace=trace,
+            started=started,
+        )
+        if result is not None:
+            return result
+
+        return _start_server_locked(expected, trace=trace, started=started)
+
+
+def _start_server_locked(expected, trace=None, started=None):
+    """Start one bridge while the caller owns the cross-process startup lock."""
+    if started is None:
+        started = time.perf_counter()
 
     py = sys.executable
     server = _server_path()
@@ -211,11 +507,28 @@ def _ensure_server(trace=None):
             trace.event("bridge.start.failed", status="error", error=error)
         return ServiceStartResult(False, code="BRIDGE_START_FAILED", error=error)
 
+    launch_id = uuid.uuid4().hex
+    launch_started_at = utc_timestamp()
+    launch_environment = os.environ.copy()
+    launch_environment.update(
+        {
+            "WPS_BRIDGE_LAUNCH_ID": launch_id,
+            "WPS_BRIDGE_LAUNCHED_BY_PID": str(os.getpid()),
+            "WPS_BRIDGE_SERVER_PATH": server,
+            "WPS_BRIDGE_PROJECT_ROOT": _project_root(),
+            "WPS_BRIDGE_LAUNCH_STARTED_AT": launch_started_at,
+        }
+    )
+
     log_path, log_warning = server_log_path()
     if trace:
         trace.event(
             "bridge.start.requested",
+            launchId=launch_id,
+            callerPid=os.getpid(),
             serverPath=server,
+            projectRoot=_project_root(),
+            launchStartedAt=launch_started_at,
             serverLog=str(log_path) if log_path else None,
         )
         if log_warning:
@@ -237,6 +550,7 @@ def _ensure_server(trace=None):
                 stderr=stderr_target,
                 creationflags=subprocess.CREATE_NEW_PROCESS_GROUP,
                 startupinfo=si,
+                env=launch_environment,
             )
         else:
             process = subprocess.Popen(
@@ -244,6 +558,17 @@ def _ensure_server(trace=None):
                 stdout=stdout_target,
                 stderr=stderr_target,
                 start_new_session=True,
+                env=launch_environment,
+            )
+        if trace:
+            trace.event(
+                "bridge.start.spawned",
+                launchId=launch_id,
+                callerPid=os.getpid(),
+                processPid=getattr(process, "pid", None),
+                serverPath=server,
+                projectRoot=_project_root(),
+                launchStartedAt=launch_started_at,
             )
     except Exception as e:
         error = f"启动桥接服务失败: {e}"
@@ -255,21 +580,102 @@ def _ensure_server(trace=None):
             log_stream.close()
 
     # 轮询等待服务就绪（最多 ~10s）
+    last_observation = None
     for _ in range(40):
         time.sleep(0.25)
-        probe = _as_health_probe(_health(with_state=True))
+        observation = _observe_health()
+        last_observation = observation
+        probe = observation.probe
         health = probe.health
         inspection = inspect_health(health, expected=expected)
         if inspection.reusable:
+            process_pid = getattr(process, "pid", None)
+            response_pid = health.get("serverPid", health.get("pid"))
+            identity_error = _observable_identity_error(health) or _listener_ownership_error(
+                observation,
+                health,
+            )
+            if identity_error:
+                _terminate_started_process(process)
+                if trace:
+                    trace.event(
+                        "bridge.start.conflicted",
+                        status="error",
+                        state="unknown_owner",
+                        error=identity_error,
+                        launchId=launch_id,
+                        processPid=process_pid,
+                        listenerBefore=observation.listener_before,
+                        listenerAfter=observation.listener_after,
+                    )
+                return ServiceStartResult(
+                    False,
+                    code="BRIDGE_INSTANCE_MISMATCH",
+                    error=identity_error,
+                    health=health,
+                    disposition="unknown_owner",
+                    listener_before=observation.listener_before,
+                    listener_after=observation.listener_after,
+                )
+            is_started_process = bool(
+                process_pid
+                and health.get("launchId") == launch_id
+                and response_pid == process_pid
+                and health.get("pid") == process_pid
+                and health.get("launchedByPid") == os.getpid()
+                and health.get("launchStartedAt") == launch_started_at
+            )
+            if not is_started_process:
+                _terminate_started_process(process)
+                identity_conflicts_with_child = bool(
+                    response_pid == process_pid or health.get("launchId") == launch_id
+                )
+                if trace:
+                    trace.event(
+                        (
+                            "bridge.start.conflicted"
+                            if identity_conflicts_with_child
+                            else "bridge.start.superseded"
+                        ),
+                        status=("error" if identity_conflicts_with_child else "healthy"),
+                        launchId=launch_id,
+                        processPid=process_pid,
+                        responseLaunchId=health.get("launchId"),
+                        responsePid=response_pid,
+                        instanceId=health.get("instanceId"),
+                    )
+                if identity_conflicts_with_child:
+                    error = "READY bridge 的 PID/launchId 与本次启动记录不一致"
+                    return ServiceStartResult(
+                        False,
+                        code="BRIDGE_INSTANCE_MISMATCH",
+                        error=error,
+                        health=health,
+                        disposition="unknown_owner",
+                        listener_before=observation.listener_before,
+                        listener_after=observation.listener_after,
+                    )
+                return ServiceStartResult(
+                    True,
+                    health=health,
+                    started=False,
+                    disposition="reused",
+                )
             if trace:
                 trace.event(
                     "bridge.start.completed",
                     status="healthy",
-                    processPid=getattr(process, "pid", None),
+                    launchId=launch_id,
+                    processPid=process_pid,
                     instanceId=health.get("instanceId"),
                     elapsedMs=round((time.perf_counter() - started) * 1000, 2),
                 )
-            return ServiceStartResult(True, health=health, started=True)
+            return ServiceStartResult(
+                True,
+                health=health,
+                started=True,
+                disposition="self_started",
+            )
         if probe.state == "responded":
             inspection_error = inspection.error
             if health is None:
@@ -288,6 +694,9 @@ def _ensure_server(trace=None):
                 code="BRIDGE_INSTANCE_MISMATCH",
                 error=inspection_error,
                 health=health if isinstance(health, dict) else None,
+                disposition=("foreign" if inspection.state == "foreign" else "unknown_owner"),
+                listener_before=observation.listener_before,
+                listener_after=observation.listener_after,
             )
         try:
             process_exit_code = process.poll() if process is not None else None
@@ -297,7 +706,14 @@ def _ensure_server(trace=None):
             error = f"桥接服务启动后提前退出（exit={process_exit_code}），请检查 server 日志"
             if trace:
                 trace.event("bridge.start.failed", status="error", error=error)
-            return ServiceStartResult(False, code="BRIDGE_START_EXITED", error=error)
+            return ServiceStartResult(
+                False,
+                code="BRIDGE_START_EXITED",
+                error=error,
+                disposition="unknown_owner",
+                listener_before=observation.listener_before,
+                listener_after=observation.listener_after,
+            )
 
     _terminate_started_process(process)
     error = "桥接服务启动超时，已回收本次启动的后台进程"
@@ -308,8 +724,19 @@ def _ensure_server(trace=None):
             error=error,
             elapsedMs=round((time.perf_counter() - started) * 1000, 2),
             serverLog=str(log_path) if log_path else None,
+            launchId=launch_id,
+            processPid=getattr(process, "pid", None),
+            listenerBefore=(last_observation.listener_before if last_observation else None),
+            listenerAfter=(last_observation.listener_after if last_observation else None),
         )
-    return ServiceStartResult(False, code="BRIDGE_START_TIMEOUT", error=error)
+    return ServiceStartResult(
+        False,
+        code="BRIDGE_START_TIMEOUT",
+        error=error,
+        disposition="unknown_owner",
+        listener_before=(last_observation.listener_before if last_observation else None),
+        listener_after=(last_observation.listener_after if last_observation else None),
+    )
 
 
 def _post(action, params, app=None, trace=None, service_health=None):
@@ -466,6 +893,18 @@ def _load_params_from_args(args):
     return action, params, app
 
 
+def _bridge_ensure_summary(service):
+    health = service.health if isinstance(service.health, dict) else {}
+    return {
+        "disposition": service.disposition,
+        "instanceId": health.get("instanceId"),
+        "launchId": health.get("launchId"),
+        "serverPid": health.get("serverPid"),
+        "listenerBefore": service.listener_before,
+        "listenerAfter": service.listener_after,
+    }
+
+
 def main():
     action, params, app = _load_params_from_args(sys.argv[1:])
     trace = ActionTrace.start(component="call")
@@ -478,11 +917,13 @@ def main():
     )
 
     service = _ensure_server(trace=trace)
+    bridge_ensure = _bridge_ensure_summary(service)
     if not service:
         result = {
             "success": False,
             "code": service.code,
             "error": service.error or "桥接服务启动失败，请检查 traceLog 与 server 日志",
+            "bridgeEnsure": bridge_ensure,
         }
         trace.event(
             "action.completed",
@@ -501,8 +942,13 @@ def main():
             trace=trace,
             service_health=service.health,
         )
+        result["bridgeEnsure"] = bridge_ensure
     except urllib.error.URLError as e:
-        result = {"success": False, "error": f"调用失败（服务无响应）: {e}"}
+        result = {
+            "success": False,
+            "error": f"调用失败（服务无响应）: {e}",
+            "bridgeEnsure": bridge_ensure,
+        }
         trace.event(
             "action.completed",
             status="error",
@@ -512,7 +958,11 @@ def main():
         print(json.dumps(trace.decorate(result), ensure_ascii=False))
         sys.exit(1)
     except Exception as e:
-        result = {"success": False, "error": f"调用失败: {e}"}
+        result = {
+            "success": False,
+            "error": f"调用失败: {e}",
+            "bridgeEnsure": bridge_ensure,
+        }
         trace.event(
             "action.completed",
             status="error",

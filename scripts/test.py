@@ -74,10 +74,10 @@ def main():
     r = api_get("/actions")
     if r.get("actions") is not None:
         print(f"    可用 action 数量: {r.get('count')}")
-        by_app = {}
+        by_owner = {}
         for a in r["actions"]:
-            by_app[a["app"]] = by_app.get(a["app"], 0) + 1
-        print(f"    按应用分布: {by_app}")
+            by_owner[a["owner"]] = by_owner.get(a["owner"], 0) + 1
+        print(f"    按 owner 分布: {by_owner}")
     else:
         print(f"    [失败] {r}")
     print()

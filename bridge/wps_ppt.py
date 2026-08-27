@@ -24,7 +24,9 @@ import queue
 import threading
 from typing import Any, Dict, Optional
 
+from powershell_contracts import render_chart_type_converter
 from service_lifecycle import stop_line_process
+from windows_com import describe_powershell_startup_failure, resolve_com_runtime
 
 # ==================== 平台检测 ====================
 IS_WINDOWS = platform.system() == "Windows"
@@ -49,6 +51,7 @@ PS_BRIDGE_SCRIPT = r'''
 $OutputEncoding = [System.Text.Encoding]::UTF8
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 $error.Clear()
+$global:WpsActivationError = $null
 
 # 创建/获取 COM 对象
 function Get-PptApp {
@@ -56,6 +59,8 @@ function Get-PptApp {
     catch {
         try { return New-Object -ComObject 'Kwpp.Application' }
         catch {
+            $hr = '0x{0:X8}' -f $_.Exception.HResult
+            $global:WpsActivationError = "New-Object failed ($hr): $($_.Exception.Message)"
             try {
                 $clsid = (Get-ItemProperty -Path 'HKCU:\Software\Classes\Kwpp.Application\CLSID' -ErrorAction Stop).'(default)'
                 if ($clsid) {
@@ -75,7 +80,12 @@ if ($global:ppt) {
     try { $global:ppt.DisplayAlerts = 0 } catch {}
     Write-Host '{"ready":true}'
 } else {
-    Write-Host '{"ready":false,"error":"无法连接WPS演示，请确认WPS已安装"}'
+    $message = if ($global:WpsActivationError) {
+        $global:WpsActivationError
+    } else {
+        '无法连接WPS演示，请确认WPS已安装'
+    }
+    Write-Host (@{ready=$false; error=$message} | ConvertTo-Json -Compress)
     exit 1
 }
 
@@ -92,6 +102,31 @@ function Convert-HexToOle($hex) {
         $b = [Convert]::ToInt32($h.Substring(4,2),16)
         return [int]($b -bor ($g -shl 8) -bor ($r -shl 16))
     } catch { return $null }
+}
+
+''' + render_chart_type_converter() + r'''
+function Convert-Distribution($value) {
+    if ($value -is [string]) {
+        switch ($value.ToLowerInvariant()) {
+            "horizontal" { return 0 }
+            "vertical" { return 1 }
+            default { throw "未知 distribute: $value" }
+        }
+    }
+    return [int]$value
+}
+
+function Convert-ZOrder($value) {
+    if ($value -is [string]) {
+        switch ($value.ToLowerInvariant()) {
+            "front" { return 0 }
+            "back" { return 1 }
+            "forward" { return 2 }
+            "backward" { return 3 }
+            default { throw "未知 order: $value" }
+        }
+    }
+    return [int]$value
 }
 
 function Get-ActivePres { if ($global:ppt.ActivePresentation) { return $global:ppt.ActivePresentation }; return $null }
@@ -591,7 +626,7 @@ function Exec-distributeShapes($p) {
     $pres = Get-ActivePres
     $slide = Get-Slide $pres ([int]$p.slideIndex)
     if (-not $slide) { return @{success=$false; error="未找到幻灯片"} }
-    try { $slide.Shapes.Distribute([int]($p.distribute), 0) | Out-Null; return @{success=$true} } catch { return @{success=$false; error=$_.Exception.Message} }
+    try { $slide.Shapes.Distribute((Convert-Distribution $p.distribute), 0) | Out-Null; return @{success=$true} } catch { return @{success=$false; error=$_.Exception.Message} }
 }
 
 function Exec-groupShapes($p) {
@@ -612,14 +647,14 @@ function Exec-setShapeZOrder($p) {
     $pres = Get-ActivePres
     $slide = Get-Slide $pres ([int]$p.slideIndex)
     if (-not $slide) { return @{success=$false; error="未找到幻灯片"} }
-    try { (Get-ShapeById $slide ([int]$p.shapeIndex)).ZOrder([int]$p.order) | Out-Null; return @{success=$true} } catch { return @{success=$false; error=$_.Exception.Message} }
+    try { (Get-ShapeById $slide ([int]$p.shapeIndex)).ZOrder((Convert-ZOrder $p.order)) | Out-Null; return @{success=$true} } catch { return @{success=$false; error=$_.Exception.Message} }
 }
 
 function Exec-smartDistribute($p) {
     $pres = Get-ActivePres
     $slide = Get-Slide $pres ([int]$p.slideIndex)
     if (-not $slide) { return @{success=$false; error="未找到幻灯片"} }
-    try { $slide.Shapes.Distribute([int]($p.distribute), 0) | Out-Null; return @{success=$true} } catch { return @{success=$false; error=$_.Exception.Message} }
+    try { $slide.Shapes.Distribute((Convert-Distribution $p.distribute), 0) | Out-Null; return @{success=$true} } catch { return @{success=$false; error=$_.Exception.Message} }
 }
 
 # ---------- 图片 ----------
@@ -871,7 +906,7 @@ function Exec-insertPptChart($p) {
     try {
         $left = if ($p.x) { [int]$p.x } else { 100 }
         $top = if ($p.y) { [int]$p.y } else { 100 }
-        $chartType = if ($p.chartType) { [int]$p.chartType } else { 1 }
+        $chartType = if ($p.chartType) { Convert-ChartType $p.chartType } else { 51 }
         $sp = $slide.Shapes.AddChart($chartType, $left, $top)
         return @{success=$true; data=@{shapeId=$sp.Id}}
     } catch { return @{success=$false; error=$_.Exception.Message} }
@@ -1160,9 +1195,22 @@ class WpsPptController:
 
     def _init_windows(self, trace=None):
         started = time.perf_counter()
-        if trace:
-            trace.event("powershell.process.starting", app="ppt", progId=PPT_PROGID)
         try:
+            com_runtime = resolve_com_runtime(PPT_PROGID)
+            if not com_runtime.available:
+                raise RuntimeError(
+                    f"{PPT_PROGID} COM 注册不完整: {com_runtime.diagnostic}"
+                )
+            selected_registration = com_runtime.selected_registration
+            if trace:
+                trace.event(
+                    "powershell.process.starting",
+                    app="ppt",
+                    progId=PPT_PROGID,
+                    clsid=(selected_registration.clsid if selected_registration else None),
+                    registryViewBits=com_runtime.selected_view_bitness,
+                    powershellExecutable=com_runtime.powershell_executable,
+                )
             self._ps_script = tempfile.NamedTemporaryFile(
                 mode='w', suffix='.ps1', delete=False, encoding='utf-8-sig'
             )
@@ -1170,10 +1218,10 @@ class WpsPptController:
             self._ps_script.close()
 
             self._ps_process = subprocess.Popen(
-                ['powershell.exe', '-NoProfile', '-NoLogo',
+                [com_runtime.powershell_executable, '-NoProfile', '-NoLogo',
                  '-ExecutionPolicy', 'Bypass', '-File', self._ps_script.name],
                 stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                text=True, encoding='utf-8', bufsize=1
+                text=True, encoding='utf-8', errors='replace', bufsize=1
             )
 
             self._stop = threading.Event()
@@ -1185,7 +1233,12 @@ class WpsPptController:
             ready = json.loads(ready_line) if ready_line else {}
             self._ready = ready.get('ready', False)
             if not self._ready:
-                err = ready.get('error', '未知错误')
+                err = describe_powershell_startup_failure(
+                    self._ps_process,
+                    self._stderr_reader,
+                    self._stderr_queue,
+                    ready.get('error'),
+                )
                 self._kill_ps()
                 raise RuntimeError(f"WPS 演示连接失败: {err}")
 

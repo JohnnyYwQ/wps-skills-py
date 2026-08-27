@@ -8,6 +8,7 @@ bridge 才能复用。BridgeLifecycle 封装显式停止与空闲回收，不持
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 import hashlib
@@ -84,7 +85,7 @@ def stop_line_process(
         pass
 
 
-def _utc_timestamp() -> str:
+def utc_timestamp() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
 
 
@@ -177,7 +178,23 @@ def current_service_identity(instance_id: Optional[str] = None) -> dict:
 
 
 def new_service_identity() -> dict:
-    return current_service_identity(instance_id=uuid.uuid4().hex)
+    identity = current_service_identity(instance_id=uuid.uuid4().hex)
+    launched_by_pid = os.environ.get("WPS_BRIDGE_LAUNCHED_BY_PID", "").strip()
+    try:
+        launched_by_pid_value = int(launched_by_pid)
+    except (TypeError, ValueError):
+        launched_by_pid_value = os.getppid()
+    identity.update(
+        {
+            "launchId": os.environ.get("WPS_BRIDGE_LAUNCH_ID") or uuid.uuid4().hex,
+            "launchedByPid": launched_by_pid_value,
+            "serverPath": os.environ.get("WPS_BRIDGE_SERVER_PATH")
+            or str(project_root() / "bridge" / "server.py"),
+            "launchStartedAt": os.environ.get("WPS_BRIDGE_LAUNCH_STARTED_AT")
+            or utc_timestamp(),
+        }
+    )
+    return identity
 
 
 @dataclass(frozen=True)
@@ -254,6 +271,9 @@ class ServiceStartResult:
     error: Optional[str] = None
     health: Optional[dict] = None
     started: bool = False
+    disposition: Optional[str] = None
+    listener_before: Optional[dict] = None
+    listener_after: Optional[dict] = None
 
     def __bool__(self) -> bool:
         return self.ok
@@ -273,10 +293,12 @@ class BridgeLifecycle:
         self._clock = clock
         self._started_monotonic = clock()
         self._last_action_monotonic = self._started_monotonic
-        self._started_at = _utc_timestamp()
+        self._started_at = utc_timestamp()
         self._stop_event = threading.Event()
         self._stop_reason = None
         self._signal_stop_reason = None
+        self._action_lock = threading.Lock()
+        self._active_action = None
         # Python 信号处理器可能在主线程持锁期间调用 request_stop；RLock 避免
         # SIGINT/SIGTERM 恰好落在 health/idle 临界区时自锁。
         self._lock = threading.RLock()
@@ -301,34 +323,85 @@ class BridgeLifecycle:
         with self._lock:
             self._last_action_monotonic = self._clock()
 
+    @contextmanager
+    def action_execution(self, action, trace_id):
+        """串行授予 Action 执行权，并在等待后重新检查停止状态。"""
+        self._action_lock.acquire()
+        admitted = False
+        try:
+            with self._lock:
+                if not self._should_stop_locked():
+                    self._active_action = {
+                        "traceId": trace_id,
+                        "action": action,
+                        "startedAt": utc_timestamp(),
+                    }
+                    admitted = True
+            yield admitted
+        finally:
+            if admitted:
+                with self._lock:
+                    self._active_action = None
+                    self._last_action_monotonic = self._clock()
+            self._action_lock.release()
+
     def idle_for_seconds(self) -> float:
         with self._lock:
             return max(0.0, self._clock() - self._last_action_monotonic)
 
-    def should_stop(self) -> bool:
+    def _should_stop_locked(self) -> bool:
         signal_reason = self._signal_stop_reason
         if signal_reason is not None:
-            self.request_stop(signal_reason)
+            if self._stop_reason is None:
+                self._stop_reason = signal_reason
+            self._stop_event.set()
         if self._stop_event.is_set():
             return True
-        if self.idle_timeout_seconds and self.idle_for_seconds() >= self.idle_timeout_seconds:
-            self.request_stop("idle_timeout")
+        if self._active_action is not None:
+            return False
+        idle_for = max(0.0, self._clock() - self._last_action_monotonic)
+        if self.idle_timeout_seconds and idle_for >= self.idle_timeout_seconds:
+            if self._stop_reason is None:
+                self._stop_reason = "idle_timeout"
+            self._stop_event.set()
             return True
         return False
 
+    def should_stop(self) -> bool:
+        with self._lock:
+            return self._should_stop_locked()
+
     def health_snapshot(self) -> dict:
+        server_pid = os.getpid()
+        with self._lock:
+            active_action = (
+                dict(self._active_action) if self._active_action is not None else None
+            )
+            shutdown_requested = bool(
+                self._stop_event.is_set() or self._signal_stop_reason is not None
+            )
+            if shutdown_requested:
+                state = "stopping"
+            elif active_action is not None:
+                state = "running"
+            else:
+                state = "idle"
+            idle_for = max(0.0, self._clock() - self._last_action_monotonic)
+            stop_reason = self._stop_reason
         snapshot = {
             "status": "ok",
+            "state": state,
             **self.identity,
-            "pid": os.getpid(),
+            "pid": server_pid,
+            "serverPid": server_pid,
             "startedAt": self._started_at,
             "uptimeSeconds": round(max(0.0, self._clock() - self._started_monotonic), 3),
-            "idleForSeconds": round(self.idle_for_seconds(), 3),
+            "idleForSeconds": round(idle_for, 3),
             "idleTimeoutSeconds": self.idle_timeout_seconds,
-            "shutdownRequested": bool(
-                self._stop_event.is_set() or self._signal_stop_reason is not None
-            ),
+            "shutdownRequested": shutdown_requested,
         }
-        if self.stop_reason:
-            snapshot["shutdownReason"] = self.stop_reason
+        if active_action is not None:
+            snapshot["activeAction"] = active_action
+        if stop_reason:
+            snapshot["shutdownReason"] = stop_reason
         return snapshot

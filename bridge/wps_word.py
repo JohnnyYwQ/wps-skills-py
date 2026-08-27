@@ -19,6 +19,7 @@ import threading
 from typing import Any, Dict, Optional
 
 from service_lifecycle import stop_line_process
+from windows_com import describe_powershell_startup_failure, resolve_com_runtime
 
 IS_WINDOWS = platform.system() == "Windows"
 IS_LINUX = platform.system() == "Linux"
@@ -38,12 +39,15 @@ PS_BRIDGE_SCRIPT = r'''
 $OutputEncoding = [System.Text.Encoding]::UTF8
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 $error.Clear()
+$global:WpsActivationError = $null
 
 function Get-WordApp {
     try { return [System.Runtime.InteropServices.Marshal]::GetActiveObject('Kwps.Application') }
     catch {
         try { return New-Object -ComObject 'Kwps.Application' }
         catch {
+            $hr = '0x{0:X8}' -f $_.Exception.HResult
+            $global:WpsActivationError = "New-Object failed ($hr): $($_.Exception.Message)"
             try {
                 $clsid = (Get-ItemProperty -Path 'HKCU:\Software\Classes\Kwps.Application\CLSID' -ErrorAction Stop).'(default)'
                 if ($clsid) {
@@ -63,7 +67,12 @@ if ($global:word) {
     try { $global:word.DisplayAlerts = $false } catch {}
     Write-Host '{"ready":true}'
 } else {
-    Write-Host '{"ready":false,"error":"无法连接WPS文字，请确认WPS已安装"}'
+    $message = if ($global:WpsActivationError) {
+        $global:WpsActivationError
+    } else {
+        '无法连接WPS文字，请确认WPS已安装'
+    }
+    Write-Host (@{ready=$false; error=$message} | ConvertTo-Json -Compress)
     exit 1
 }
 
@@ -498,9 +507,22 @@ class WpsWordController:
 
     def _init_windows(self, trace=None):
         started = time.perf_counter()
-        if trace:
-            trace.event("powershell.process.starting", app="word", progId=WORD_PROGID)
         try:
+            com_runtime = resolve_com_runtime(WORD_PROGID)
+            if not com_runtime.available:
+                raise RuntimeError(
+                    f"{WORD_PROGID} COM 注册不完整: {com_runtime.diagnostic}"
+                )
+            selected_registration = com_runtime.selected_registration
+            if trace:
+                trace.event(
+                    "powershell.process.starting",
+                    app="word",
+                    progId=WORD_PROGID,
+                    clsid=(selected_registration.clsid if selected_registration else None),
+                    registryViewBits=com_runtime.selected_view_bitness,
+                    powershellExecutable=com_runtime.powershell_executable,
+                )
             self._ps_script = tempfile.NamedTemporaryFile(
                 mode='w', suffix='.ps1', delete=False, encoding='utf-8-sig'
             )
@@ -508,10 +530,10 @@ class WpsWordController:
             self._ps_script.close()
 
             self._ps_process = subprocess.Popen(
-                ['powershell.exe', '-NoProfile', '-NoLogo',
+                [com_runtime.powershell_executable, '-NoProfile', '-NoLogo',
                  '-ExecutionPolicy', 'Bypass', '-File', self._ps_script.name],
                 stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                text=True, encoding='utf-8', bufsize=1
+                text=True, encoding='utf-8', errors='replace', bufsize=1
             )
 
             self._stop = threading.Event()
@@ -523,7 +545,12 @@ class WpsWordController:
             ready = json.loads(ready_line) if ready_line else {}
             self._ready = ready.get('ready', False)
             if not self._ready:
-                err = ready.get('error', '未知错误')
+                err = describe_powershell_startup_failure(
+                    self._ps_process,
+                    self._stderr_reader,
+                    self._stderr_queue,
+                    ready.get('error'),
+                )
                 self._kill_ps()
                 raise RuntimeError(f"WPS 文字连接失败: {err}")
 
