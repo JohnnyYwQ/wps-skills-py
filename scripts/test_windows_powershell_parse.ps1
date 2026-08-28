@@ -14,7 +14,7 @@ function Invoke-Python {
 
     & $PythonExe @Arguments
     if ($LASTEXITCODE -ne 0) {
-        throw "Python 命令失败，exit code: $LASTEXITCODE"
+        throw "Python command failed with exit code $LASTEXITCODE"
     }
 }
 
@@ -62,12 +62,12 @@ for name, script in (
         ) | Out-Null
 
         if ($parseErrors.Count -eq 0) {
-            Write-Host "[PASS] $app bridge: Windows PowerShell 解析成功"
+            Write-Host "[PASS] $app bridge: Windows PowerShell parse succeeded"
             continue
         }
 
         $failed = $true
-        Write-Host "[FAIL] $app bridge: $($parseErrors.Count) 个解析错误"
+        Write-Host "[FAIL] $app bridge: $($parseErrors.Count) parse error(s)"
         foreach ($parseError in $parseErrors) {
             $line = $parseError.Extent.StartLineNumber
             $column = $parseError.Extent.StartColumnNumber
@@ -76,7 +76,7 @@ for name, script in (
     }
 
     if ($failed) {
-        throw "PowerShell bridge 解析回归测试失败"
+        throw "PowerShell bridge parse regression test failed"
     }
 } finally {
     $env:WPS_BRIDGE_REPO_ROOT = $previousRepoRoot
@@ -89,4 +89,4 @@ for name, script in (
     }
 }
 
-Write-Host "Windows PowerShell bridge 解析回归测试通过。"
+Write-Host "Windows PowerShell bridge parse regression test passed."

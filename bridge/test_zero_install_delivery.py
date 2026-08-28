@@ -46,6 +46,21 @@ class ZeroInstallDeliveryTests(unittest.TestCase):
             for term in prohibited_terms:
                 self.assertNotIn(term, content, f"{relative_path} still mentions {term}")
 
+    def test_windows_powershell_entry_scripts_are_ascii_for_powershell_5_1(self):
+        for relative_path in (
+            "scripts/test_windows_powershell_parse.ps1",
+            "scripts/test_windows_wps_regressions.ps1",
+        ):
+            with self.subTest(path=relative_path):
+                content = (ROOT / relative_path).read_bytes()
+                try:
+                    content.decode("ascii")
+                except UnicodeDecodeError as exc:
+                    self.fail(
+                        f"{relative_path} must be ASCII because Windows PowerShell 5.1 "
+                        f"treats UTF-8 without BOM as the system ANSI code page: {exc}"
+                    )
+
 
 if __name__ == "__main__":
     unittest.main()

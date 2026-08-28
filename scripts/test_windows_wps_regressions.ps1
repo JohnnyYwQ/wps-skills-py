@@ -28,16 +28,16 @@ function Invoke-WpsAction {
     try {
         $response = $responseText | ConvertFrom-Json
     } catch {
-        throw "[$Label] Action CLI 未返回合法 JSON（exit code $exitCode）：$responseText"
+        throw "[$Label] Action CLI returned invalid JSON (exit code $exitCode): $responseText"
     }
 
     if (-not $response.success) {
         $code = if ($response.code) { $response.code } else { "UNKNOWN" }
         $errorMessage = if ($response.error) { $response.error } else { $responseText }
-        throw "[$Label] 失败（$code）：$errorMessage"
+        throw "[$Label] failed ($code): $errorMessage"
     }
     if ($response.data -is [System.Array]) {
-        throw "[$Label] data 必须是 object，实际为 array：$responseText"
+        throw "[$Label] data must be an object, got an array: $responseText"
     }
 
     Write-Host "[PASS] $Label"
@@ -51,45 +51,45 @@ function Assert-ExportedImage {
     )
 
     if (-not [System.IO.File]::Exists($Path)) {
-        throw "[$Label] 未生成文件：$Path"
+        throw "[$Label] output file was not created: $Path"
     }
     $length = (Get-Item -LiteralPath $Path).Length
     if ($length -le 0) {
-        throw "[$Label] 生成了空文件：$Path"
+        throw "[$Label] output file is empty: $Path"
     }
-    Write-Host "[PASS] $Label 文件有效（$length bytes）"
+    Write-Host "[PASS] $Label output is valid ($length bytes)"
 }
 
 if ($env:OS -ne "Windows_NT") {
-    throw "此脚本只能在 Windows 实机运行"
+    throw "This script must run on a real Windows machine"
 }
 
 try {
     [System.IO.Directory]::CreateDirectory($artifactRoot) | Out-Null
-    Write-Host "测试产物目录：$artifactRoot"
-    Write-Host "测试期间请勿手动切换 WPS 的活动文档。"
+    Write-Host "Test artifact directory: $artifactRoot"
+    Write-Host "Do not switch the active WPS document while this test is running."
 
     & (Join-Path $PSScriptRoot "test_windows_powershell_parse.ps1") -PythonExe $PythonExe
 
     foreach ($app in @("excel", "ppt", "word")) {
-        Invoke-WpsAction -Label "$app bridge 初始化" -Action "getAppInfo" -App $app | Out-Null
+        Invoke-WpsAction -Label "$app bridge initialization" -Action "getAppInfo" -App $app | Out-Null
     }
 
-    $created = Invoke-WpsAction -Label "创建测试工作簿" -Action "createWorkbook" -App "excel"
+    $created = Invoke-WpsAction -Label "Create test workbook" -Action "createWorkbook" -App "excel"
     $workbookCreated = $true
-    Write-Host "测试工作簿：$($created.data.name)"
+    Write-Host "Test workbook: $($created.data.name)"
 
-    Invoke-WpsAction -Label "写入图表数据" -Action "setRangeData" -App "excel" -Params @{
+    Invoke-WpsAction -Label "Write chart data" -Action "setRangeData" -App "excel" -Params @{
         range = "A1:B4"
         data = @(
-            @("类别", "数值"),
+            @("Category", "Value"),
             @("A", 10),
             @("B", 20),
             @("C", 15)
         )
     } | Out-Null
 
-    $chart = Invoke-WpsAction -Label "创建带数据标签的图表" -Action "createChart" -App "excel" -Params @{
+    $chart = Invoke-WpsAction -Label "Create chart with data labels" -Action "createChart" -App "excel" -Params @{
         dataRange = "A1:B4"
         chartType = "column"
         title = "bridge regression"
@@ -104,40 +104,40 @@ try {
     }
     $chartName = [string]$chart.data.chartName
     if ([string]::IsNullOrWhiteSpace($chartName)) {
-        throw "createChart 未返回 chartName"
+        throw "createChart did not return chartName"
     }
 
     $chartImage = Join-Path $artifactRoot "chart.png"
-    $chartExport = Invoke-WpsAction -Label "导出图表图片" -Action "exportChartAsImage" -App "excel" -Params @{
+    $chartExport = Invoke-WpsAction -Label "Export chart image" -Action "exportChartAsImage" -App "excel" -Params @{
         chartName = $chartName
         outputPath = $chartImage
         format = "PNG"
     }
     if ($chartExport.data -isnot [PSCustomObject]) {
-        throw "exportChartAsImage 的 data 不是 object"
+        throw "exportChartAsImage data is not an object"
     }
-    Assert-ExportedImage -Label "导出图表图片" -Path $chartImage
+    Assert-ExportedImage -Label "Export chart image" -Path $chartImage
 
     $rangeImage = Join-Path $artifactRoot "range.png"
-    $rangeExport = Invoke-WpsAction -Label "导出区域图片" -Action "exportRangeAsImage" -App "excel" -Params @{
+    $rangeExport = Invoke-WpsAction -Label "Export range image" -Action "exportRangeAsImage" -App "excel" -Params @{
         range = "A1:B4"
         outputPath = $rangeImage
         format = "PNG"
     }
     if ($rangeExport.data -isnot [PSCustomObject]) {
-        throw "exportRangeAsImage 的 data 不是 object"
+        throw "exportRangeAsImage data is not an object"
     }
-    Assert-ExportedImage -Label "导出区域图片" -Path $rangeImage
+    Assert-ExportedImage -Label "Export range image" -Path $rangeImage
 
     $testPassed = $true
 } finally {
     if ($workbookCreated) {
         try {
-            Invoke-WpsAction -Label "关闭测试工作簿" -Action "closeWorkbook" -App "excel" -Params @{
+            Invoke-WpsAction -Label "Close test workbook" -Action "closeWorkbook" -App "excel" -Params @{
                 save = $false
             } | Out-Null
         } catch {
-            Write-Warning "测试工作簿自动关闭失败：$($_.Exception.Message)"
+            Write-Warning "Could not close the test workbook: $($_.Exception.Message)"
         }
     }
 
@@ -149,8 +149,8 @@ try {
             [System.IO.Directory]::Delete($artifactRoot, $true)
         }
     } else {
-        Write-Host "测试产物保留在：$artifactRoot"
+        Write-Host "Test artifacts retained at: $artifactRoot"
     }
 }
 
-Write-Host "Windows WPS bridge 实机回归测试全部通过。"
+Write-Host "Windows WPS bridge real-machine regression test passed."
