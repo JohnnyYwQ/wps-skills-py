@@ -8196,6 +8196,9 @@
           "outputPath": {
             "type": "string"
           },
+          "overwrite": {
+            "type": "boolean"
+          },
           "targetFormat": {
             "type": "string"
           }
@@ -8220,7 +8223,7 @@
       "prerequisites": [
         "active_document"
       ],
-      "risk": "write"
+      "risk": "destructive"
     },
     {
       "owner": "word",
@@ -8231,6 +8234,9 @@
         "properties": {
           "outputPath": {
             "type": "string"
+          },
+          "overwrite": {
+            "type": "boolean"
           }
         },
         "required": [],
@@ -8251,7 +8257,7 @@
       "prerequisites": [
         "active_document"
       ],
-      "risk": "write"
+      "risk": "destructive"
     },
     {
       "owner": "word",
@@ -9026,6 +9032,9 @@
         "properties": {
           "filePath": {
             "type": "string"
+          },
+          "overwrite": {
+            "type": "boolean"
           }
         },
         "required": [
@@ -9052,7 +9061,7 @@
       "prerequisites": [
         "active_document"
       ],
-      "risk": "write"
+      "risk": "destructive"
     },
     {
       "owner": "word",

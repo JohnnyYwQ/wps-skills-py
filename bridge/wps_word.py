@@ -18,6 +18,7 @@ import queue
 import threading
 from typing import Any, Dict, Optional
 
+from action_catalog import ActionCatalog, INTERNAL_WINDOWS_HANDLERS
 from line_process import stop_line_process
 from action_timing import bounded_timeout
 from windows_com import describe_powershell_startup_failure, resolve_com_runtime
@@ -27,7 +28,16 @@ IS_LINUX = platform.system() == "Linux"
 IS_MACOS = platform.system() == "Darwin"
 
 WORD_PROGID = "Kwps.Application"
-EXEC_TIMEOUT = 60
+EXEC_TIMEOUT = 120
+
+_WORD_CATALOG = ActionCatalog.from_path()
+
+
+def _requires_active_document(action: str) -> bool:
+    """Read the Word document prerequisite from its Action Contract."""
+    if action in INTERNAL_WINDOWS_HANDLERS["word"]:
+        return False
+    return "active_document" in _WORD_CATALOG.get("word", action)["prerequisites"]
 
 PS_BRIDGE_SCRIPT = r'''
 $OutputEncoding = [System.Text.Encoding]::UTF8
@@ -397,34 +407,74 @@ function Exec-save($p) {
     if (-not $doc) { return @{success=$false; error="无活动文档"} }
     try { $doc.Save(); return @{success=$true} } catch { return @{success=$false; error=$_.Exception.Message} }
 }
+function Invoke-WordSafeTargetWrite($targetPath, $overwrite, [scriptblock]$write) {
+    if (-not (Test-Path -LiteralPath $targetPath)) {
+        try {
+            & $write
+            return @{success=$true}
+        } catch {
+            return @{success=$false; code="TARGET_WRITE_FAILED"; error=$_.Exception.Message}
+        }
+    }
+    if (-not $overwrite) {
+        return @{success=$false; code="TARGET_EXISTS"; error="目标文件已存在: $targetPath"}
+    }
+
+    try {
+        $fullPath = [System.IO.Path]::GetFullPath($targetPath)
+        $directory = [System.IO.Path]::GetDirectoryName($fullPath)
+        $backupPath = [System.IO.Path]::Combine(
+            $directory,
+            "." + [System.IO.Path]::GetFileName($fullPath) + "." + [Guid]::NewGuid() + ".wps-backup"
+        )
+        [System.IO.File]::Copy($fullPath, $backupPath, $false)
+    } catch {
+        return @{success=$false; code="OVERWRITE_NOT_SAFE"; error="无法安全备份现有目标: $($_.Exception.Message)"}
+    }
+
+    $keepBackup = $true
+    try {
+        & $write
+        $keepBackup = $false
+        return @{success=$true}
+    } catch {
+        $writeError = $_.Exception.Message
+        try {
+            [System.IO.File]::Copy($backupPath, $fullPath, $true)
+            $keepBackup = $false
+            return @{success=$false; code="TARGET_WRITE_FAILED"; error="目标写入失败，已恢复原文件: $writeError"}
+        } catch {
+            return @{success=$false; code="OVERWRITE_RESTORE_FAILED"; error="目标写入失败且无法恢复；备份保留在 $backupPath: $writeError"}
+        }
+    } finally {
+        if (-not $keepBackup) {
+            try { [System.IO.File]::Delete($backupPath) } catch {}
+        }
+    }
+}
 function Exec-saveAs($p) {
     $doc = Get-ActiveDoc
     if (-not $doc) { return @{success=$false; error="无活动文档"} }
-    try {
-        if (Test-Path $p.filePath) { Remove-Item $p.filePath -Force -ErrorAction SilentlyContinue }
-        $doc.SaveAs($p.filePath)
-        $sz = 0
-        if (Test-Path $p.filePath) { $sz = (Get-Item $p.filePath).Length }
-        return @{success=$true; data=@{path=$p.filePath; size=$sz}}
-    } catch { return @{success=$false; error=$_.Exception.Message} }
+    $writeResult = Invoke-WordSafeTargetWrite $p.filePath $p.overwrite { $doc.SaveAs($p.filePath) }
+    if (-not $writeResult.success) { return $writeResult }
+    $sz = (Get-Item -LiteralPath $p.filePath).Length
+    return @{success=$true; data=@{path=$p.filePath; size=$sz}}
 }
 function Exec-convertToPDF($p) {
     $doc = Get-ActiveDoc
     if (-not $doc) { return @{success=$false; error="无活动文档"} }
     $out = if ($p.outputPath) { $p.outputPath } else { $doc.Path + '\' + $doc.Name + '.pdf' }
-    try {
-        if (Test-Path $out) { Remove-Item $out -Force -ErrorAction SilentlyContinue }
-        $doc.ExportAsFixedFormat($out, 17); return @{success=$true; data=@{path=$out}}
-    } catch { return @{success=$false; error=$_.Exception.Message} }
+    $writeResult = Invoke-WordSafeTargetWrite $out $p.overwrite { $doc.ExportAsFixedFormat($out, 17) }
+    if (-not $writeResult.success) { return $writeResult }
+    return @{success=$true; data=@{path=$out}}
 }
 function Exec-convertFormat($p) {
     $doc = Get-ActiveDoc
     if (-not $doc) { return @{success=$false; error="无活动文档"} }
     $out = if ($p.outputPath) { $p.outputPath } else { $doc.Path + '\' + $doc.Name + '.' + $p.targetFormat }
-    try {
-        if (Test-Path $out) { Remove-Item $out -Force -ErrorAction SilentlyContinue }
-        $doc.SaveAs($out); return @{success=$true; data=@{path=$out}}
-    } catch { return @{success=$false; error=$_.Exception.Message} }
+    $writeResult = Invoke-WordSafeTargetWrite $out $p.overwrite { $doc.SaveAs($out) }
+    if (-not $writeResult.success) { return $writeResult }
+    return @{success=$true; data=@{path=$out}}
 }
 function Exec-reconnect($p) {
     try { $global:word = $null; $global:word = Get-WordApp } catch {}
@@ -438,6 +488,10 @@ function Exec-reconnect($p) {
 function Exec-getSelectedText($p) { try { return @{success=$true; data=@{text=$global:word.Selection.Text}} } catch { return @{success=$false; error=$_.Exception.Message} } }
 function Exec-setSelectedText($p) { try { $global:word.Selection.Text = $p.text; return @{success=$true} } catch { return @{success=$false; error=$_.Exception.Message} } }
 function Exec-getAppInfo($p) { try { return @{success=$true; data=@{app="WPS文字"; version=$global:word.Version}} } catch { return @{success=$false; error=$_.Exception.Message} } }
+
+function Get-WordActiveDocument {
+    try { return $global:word.ActiveDocument } catch { return $null }
+}
 
 # ==================== 主循环（必须位于所有 Exec-* 函数定义之后） ====================
 while ($true) {
@@ -459,7 +513,15 @@ while ($true) {
         $attempt = $cmd.attempt
         $traceId = $cmd.traceId
 
-        $result = & "Exec-$action" $params
+        if ($cmd.requiresActiveDocument -and -not (Get-WordActiveDocument)) {
+            $result = @{
+                success=$false
+                code="NO_ACTIVE_DOCUMENT"
+                error="没有活动文字文档；请先创建或打开文字文档"
+            }
+        } else {
+            $result = & "Exec-$action" $params
+        }
         $sw.Stop()
         if ($null -eq $result) { $result = @{success=$true; data=$null} }
         if ($result -isnot [hashtable]) { $result = @{success=$true; data=$result} }
@@ -712,6 +774,7 @@ class WpsWordController:
             "attempt": attempt,
             "action": action,
             "params": params,
+            "requiresActiveDocument": _requires_active_document(action),
         }, ensure_ascii=True)
         self._drain_stderr(trace, attempt)
         started = time.perf_counter()

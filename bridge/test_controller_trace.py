@@ -147,6 +147,52 @@ class ControllerTraceTests(unittest.TestCase):
             command["requiresActivePresentation"] for command in commands
         ])
 
+    def test_word_fake_process_receives_attach_first_startup_script(self):
+        resolution = _windows_com_resolution(
+            r"C:\\Windows\\System32\\powershell.exe",
+        )
+        process = _ready_powershell_process(_InputCapture())
+
+        with patch.object(wps_word, "IS_WINDOWS", True), patch.object(
+            wps_word, "IS_LINUX", False,
+        ), patch.object(
+            wps_word, "resolve_com_runtime", return_value=resolution,
+        ), patch.object(wps_word.subprocess, "Popen", return_value=process) as popen:
+            controller = wps_word.WpsWordController()
+            try:
+                script = Path(popen.call_args.args[0][-1]).read_text(encoding="utf-8-sig")
+            finally:
+                controller.close()
+
+        self.assertLess(
+            script.index("GetActiveObject('Kwps.Application')"),
+            script.index("New-Object -ComObject 'Kwps.Application'"),
+        )
+        self.assertNotIn("Documents.Add", script[:script.index("function Exec-ping")])
+        self.assertIn("EXIT\n", process.stdin.lines)
+
+    def test_word_command_derives_active_document_requirement_from_contract(self):
+        controller = object.__new__(wps_word.WpsWordController)
+        controller._ps_process = _RunningProcess()
+        controller._ready = True
+        controller._id_counter = 0
+        controller._id_lock = threading.Lock()
+        controller._stop = None
+        controller._read_result = Mock(return_value={"success": True})
+
+        controller._exec_windows("getDocumentText", {})
+        controller._exec_windows("createDocument", {})
+        controller._exec_windows("openDocument", {"filePath": r"C:\\tmp\\report.docx"})
+
+        commands = [
+            json.loads(line)
+            for line in controller._ps_process.stdin.lines
+            if line.strip()
+        ]
+        self.assertEqual([True, False, False], [
+            command["requiresActiveDocument"] for command in commands
+        ])
+
     def test_windows_controllers_launch_the_resolved_powershell_executable(self):
         cases = (
             (wps_excel, wps_excel.WpsExcelController),

@@ -368,6 +368,57 @@ class ActionManifestValidationTests(unittest.TestCase):
             ),
         )
 
+    def test_word_contracts_preserve_active_document_and_targets(self):
+        catalog = ActionCatalog.from_path()
+        script = wps_word.PS_BRIDGE_SCRIPT
+
+        for action, path_field in (
+            ("saveAs", "filePath"),
+            ("convertToPDF", "outputPath"),
+            ("convertFormat", "outputPath"),
+        ):
+            with self.subTest(action=action):
+                contract = catalog.get("word", action)
+                self.assertEqual("destructive", contract["risk"])
+                self.assertEqual(
+                    "boolean", contract["parameters"]["properties"]["overwrite"]["type"],
+                )
+                params = {"targetFormat": "docx"} if action == "convertFormat" else {}
+                if action == "saveAs":
+                    params[path_field] = r"C:\\tmp\\report.docx"
+                catalog.validate_params("word", action, {**params, "overwrite": True})
+                with self.assertRaises(ActionValidationError):
+                    catalog.validate_params("word", action, {**params, "overwrite": "yes"})
+
+        self.assertLess(
+            script.index("GetActiveObject('Kwps.Application')"),
+            script.index("New-Object -ComObject 'Kwps.Application'"),
+        )
+        startup = script[:script.index("function Exec-ping")]
+        self.assertNotIn("Documents.Add", startup)
+        self.assertIn("NO_ACTIVE_DOCUMENT", script)
+        self.assertRegex(
+            script,
+            r'if \(\$cmd\.requiresActiveDocument -and -not \(Get-WordActiveDocument\)\) \{\s*\$result = @\{\s*success=\$false\s*code="NO_ACTIVE_DOCUMENT"',
+        )
+        self.assertRegex(
+            script,
+            re.compile(r"function Exec-createDocument\(\$p\).*Documents\.Add", re.DOTALL),
+        )
+        self.assertRegex(
+            script,
+            re.compile(r"function Exec-openDocument\(\$p\).*Documents\.Open", re.DOTALL),
+        )
+        self.assertNotRegex(script, r"\.Quit\s*\(")
+        self.assertNotIn("Remove-Item", script)
+        self.assertIn("function Invoke-WordSafeTargetWrite", script)
+        self.assertEqual(4, script.count("Invoke-WordSafeTargetWrite"))
+        self.assertIn("TARGET_EXISTS", script)
+        self.assertIn("OVERWRITE_NOT_SAFE", script)
+        self.assertIn("OVERWRITE_RESTORE_FAILED", script)
+        self.assertIn("[System.IO.File]::Copy($backupPath, $fullPath, $true)", script)
+        self.assertEqual(120, wps_word.EXEC_TIMEOUT)
+
 
 if __name__ == "__main__":
     unittest.main()
