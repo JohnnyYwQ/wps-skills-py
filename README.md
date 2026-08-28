@@ -43,7 +43,7 @@ python scripts/call.py addSlide --app ppt --params-file C:\tmp\slide.json
 python scripts/test_ci.py
 ```
 
-自动化套件覆盖 Catalog、Manifest、Action CLI、Runtime、mutex、风险策略、三个控制器的静态 Contract、trace 与子进程清理。Windows/WPS 实机验证仍是运行环境验收，非本轮交付前提。
+自动化套件覆盖 Catalog、Manifest、Action CLI、Runtime、mutex、风险策略、三个控制器的静态 Contract、trace 与子进程清理；同时校验 235 个 Action 都已纳入实机套件且默认参数符合 Action Contract。它不会在 GitHub runner 上启动 WPS 或执行 COM 行为。
 
 Windows PowerShell bridge 的纯语法回归测试可在不安装 WPS 的 Windows 或
 GitHub Actions `windows-latest` runner 上运行：
@@ -52,11 +52,25 @@ GitHub Actions `windows-latest` runner 上运行：
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts\test_windows_powershell_parse.ps1
 ```
 
-在安装了 WPS Office 的 Windows 实机上，可运行完整 bridge 回归测试。脚本会创建并
-关闭一个不保存的测试工作簿；测试期间不要手动切换 WPS 的活动文档：
+在安装了 WPS Office 的 Windows 实机上，可先运行针对近期 bridge bug 的小型回归测试。脚本会创建并关闭一个不保存的测试工作簿：
 
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts\test_windows_wps_regressions.ps1
 ```
 
 如需保留导出的 PNG 供人工检查，附加 `-KeepArtifacts`。
+
+要按 Bridge、Excel、PPT、Word 场景执行全部 235 个 Action，运行：
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\test_windows_wps_all_actions.ps1
+```
+
+默认会执行包括 PPT 文本选择和放映在内的全部 Action。测试前先保存或关闭无关 WPS 文档，运行期间不要手动切换活动文档。结果写入 `test-results\wps-full-<时间>`，其中：
+
+- `report.json`：完整汇总、参数、响应和效果断言；
+- `failures.log`：适合直接复制或发回的失败摘要；
+- `actions.jsonl`：逐项追加的原始执行记录，即使中途异常也能保留；
+- `traces\`：能够收集到的 Action trace 副本。
+
+如果当前机器不方便自动选择 PPT 文本或启动放映，可附加 `-SkipInteractive`；这些 Action 会明确记为 `skip`，不会被伪装成通过。WPS Word 当前没有 `closeDocument` Action，因此脚本不会越过 Action Contract 自动关闭生成的 Word 文档，检查完成后由执行者关闭。

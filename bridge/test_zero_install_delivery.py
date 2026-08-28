@@ -51,6 +51,7 @@ class ZeroInstallDeliveryTests(unittest.TestCase):
         for relative_path in (
             "scripts/test_windows_powershell_parse.ps1",
             "scripts/test_windows_wps_regressions.ps1",
+            "scripts/test_windows_wps_all_actions.ps1",
         ):
             with self.subTest(path=relative_path):
                 content = (ROOT / relative_path).read_bytes()

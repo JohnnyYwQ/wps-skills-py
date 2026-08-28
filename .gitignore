@@ -102,6 +102,7 @@ coverage/
 .nyc_output/
 *.lcov
 .coverage
+test-results/
 
 # ============================================
 # WPS 相关

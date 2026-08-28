@@ -23,9 +23,17 @@ try {
     $exportScript = Join-Path $PSScriptRoot "export_windows_powershell_bridges.py"
     Invoke-Python -Arguments @($exportScript, "--output-dir", $tempRoot)
 
+    $parseTargets = @(
+        @{Label = "excel bridge"; Path = (Join-Path $tempRoot "wps_excel.ps1")},
+        @{Label = "ppt bridge"; Path = (Join-Path $tempRoot "wps_ppt.ps1")},
+        @{Label = "word bridge"; Path = (Join-Path $tempRoot "wps_word.ps1")},
+        @{Label = "full-suite entrypoint"; Path = (Join-Path $PSScriptRoot "test_windows_wps_all_actions.ps1")}
+    )
+
     $failed = $false
-    foreach ($app in @("excel", "ppt", "word")) {
-        $scriptPath = Join-Path $tempRoot "wps_$app.ps1"
+    foreach ($target in $parseTargets) {
+        $label = $target.Label
+        $scriptPath = $target.Path
         $tokens = $null
         $parseErrors = $null
         [System.Management.Automation.Language.Parser]::ParseFile(
@@ -35,12 +43,12 @@ try {
         ) | Out-Null
 
         if ($parseErrors.Count -eq 0) {
-            Write-Host "[PASS] $app bridge: Windows PowerShell parse succeeded"
+            Write-Host "[PASS] ${label}: Windows PowerShell parse succeeded"
             continue
         }
 
         $failed = $true
-        Write-Host "[FAIL] $app bridge: $($parseErrors.Count) parse error(s)"
+        Write-Host "[FAIL] ${label}: $($parseErrors.Count) parse error(s)"
         foreach ($parseError in $parseErrors) {
             $line = $parseError.Extent.StartLineNumber
             $column = $parseError.Extent.StartColumnNumber
