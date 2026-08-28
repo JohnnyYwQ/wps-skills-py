@@ -281,25 +281,10 @@ class ActionManifestValidationTests(unittest.TestCase):
         startup = script[:script.index("function Exec-ping")]
         self.assertNotIn("Workbooks.Add", startup)
         self.assertIn("NO_ACTIVE_DOCUMENT", script)
-        allowed_actions = re.search(
-            r"\$global:ExcelActionsWithoutActiveWorkbook = @\((.*?)\)",
-            script,
-            re.DOTALL,
-        )
-        self.assertIsNotNone(allowed_actions)
-        self.assertEqual(
-            {"ping"} | {
-                summary["action"]
-                for summary in catalog.list(owner="excel")
-                if "active_workbook" not in catalog.get(
-                    "excel", summary["action"],
-                )["prerequisites"]
-            },
-            set(re.findall(r'"([A-Za-z][A-Za-z0-9]*)"', allowed_actions.group(1))),
-        )
+        self.assertNotIn("ExcelActionsWithoutActiveWorkbook", script)
         self.assertRegex(
             script,
-            r'if \(\(Test-ExcelActionRequiresActiveWorkbook \$action\) -and -not \(Get-ExcelActiveWorkbook\)\) \{\s*\$result = @\{\s*success=\$false\s*code="NO_ACTIVE_DOCUMENT"',
+            r'if \(\$cmd\.requiresActiveWorkbook -and -not \(Get-ExcelActiveWorkbook\)\) \{\s*\$result = @\{\s*success=\$false\s*code="NO_ACTIVE_DOCUMENT"',
         )
         self.assertRegex(
             script,

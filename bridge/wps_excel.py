@@ -21,6 +21,7 @@ import queue
 import threading
 from typing import Any, Dict, Optional
 
+from action_catalog import ActionCatalog, INTERNAL_WINDOWS_HANDLERS
 from powershell_contracts import render_chart_type_converter
 from line_process import stop_line_process
 from action_timing import bounded_timeout
@@ -37,16 +38,21 @@ EXCEL_PROGID = "Ket.Application"
 # 单个 action 执行超时（秒）：超过则强杀 PowerShell 桥接进程，避免 COM 弹框导致永久卡死
 EXEC_TIMEOUT = 120
 
+_EXCEL_CATALOG = ActionCatalog.from_path()
+
+
+def _requires_active_workbook(action: str) -> bool:
+    """Read the Excel document prerequisite from its Action Contract."""
+    if action in INTERNAL_WINDOWS_HANDLERS["excel"]:
+        return False
+    return "active_workbook" in _EXCEL_CATALOG.get("excel", action)["prerequisites"]
+
 # PowerShell 桥接脚本（持久进程模式）
 PS_BRIDGE_SCRIPT = r'''
 $OutputEncoding = [System.Text.Encoding]::UTF8
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 $error.Clear()
 $global:WpsActivationError = $null
-$global:ExcelActionsWithoutActiveWorkbook = @(
-    "ping", "getOpenWorkbooks", "getAppInfo", "reconnect", "switchWorkbook",
-    "createWorkbook", "openWorkbook"
-)
 
 # 创建/获取 COM 对象
 function Get-ExcelApp {
@@ -1020,10 +1026,6 @@ function Exec-getSelectedText($p) { try { return @{success=$true; data=@{text=$g
 function Exec-setSelectedText($p) { try { $global:excel.Selection.Text = $p.text; return @{success=$true} } catch { return @{success=$false; error=$_.Exception.Message} } }
 function Exec-getAppInfo($p) { try { return @{success=$true; data=@{app="WPS表格"; version=$global:excel.Version}} } catch { return @{success=$false; error=$_.Exception.Message} } }
 
-function Test-ExcelActionRequiresActiveWorkbook($action) {
-    return $global:ExcelActionsWithoutActiveWorkbook -notcontains $action
-}
-
 function Get-ExcelActiveWorkbook {
     try { return $global:excel.ActiveWorkbook } catch { return $null }
 }
@@ -1051,7 +1053,7 @@ while ($true) {
         $attempt = $cmd.attempt
         $traceId = $cmd.traceId
 
-        if ((Test-ExcelActionRequiresActiveWorkbook $action) -and -not (Get-ExcelActiveWorkbook)) {
+        if ($cmd.requiresActiveWorkbook -and -not (Get-ExcelActiveWorkbook)) {
             $result = @{
                 success=$false
                 code="NO_ACTIVE_DOCUMENT"
@@ -1368,6 +1370,7 @@ class WpsExcelController:
             "attempt": attempt,
             "action": action,
             "params": params,
+            "requiresActiveWorkbook": _requires_active_workbook(action),
         }
         cmd = json.dumps(command, ensure_ascii=True)
         self._drain_stderr(trace, attempt)

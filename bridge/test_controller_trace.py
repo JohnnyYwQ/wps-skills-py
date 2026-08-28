@@ -81,6 +81,27 @@ class ControllerTraceTests(unittest.TestCase):
         self.assertNotIn("Workbooks.Add", script[:script.index("function Exec-ping")])
         self.assertIn("EXIT\n", process.stdin.lines)
 
+    def test_excel_command_derives_active_workbook_requirement_from_contract(self):
+        controller = object.__new__(wps_excel.WpsExcelController)
+        controller._ps_process = _RunningProcess()
+        controller._ready = True
+        controller._id_counter = 0
+        controller._id_lock = threading.Lock()
+        controller._stop = None
+        controller._read_result = Mock(return_value={"success": True})
+
+        controller._exec_windows("setCellValue", {"row": 1, "col": 1, "value": 42})
+        controller._exec_windows("createWorkbook", {})
+
+        commands = [
+            json.loads(line)
+            for line in controller._ps_process.stdin.lines
+            if line.strip()
+        ]
+        self.assertEqual([True, False], [
+            command["requiresActiveWorkbook"] for command in commands
+        ])
+
     def test_windows_controllers_launch_the_resolved_powershell_executable(self):
         cases = (
             (wps_excel, wps_excel.WpsExcelController),
