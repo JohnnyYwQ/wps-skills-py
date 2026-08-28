@@ -155,6 +155,14 @@ def _effect_errors(owner: str, action: str, params: dict, response: dict):
             errors.append("comment readback returned no comments")
         elif action == "findReplace" and int(data.get("count", 0)) < 1:
             errors.append("find/replace returned no replacements")
+        elif action == "getSheetList":
+            sheet_names = {
+                str(sheet.get("name", ""))
+                for sheet in data.get("sheets", [])
+                if isinstance(sheet, dict)
+            }
+            if "SuiteCopy" not in sheet_names:
+                errors.append(f"copied sheet readback missing SuiteCopy: {sorted(sheet_names)!r}")
     elif owner == "ppt":
         if action == "getSlideTitle" and "PPT_TITLE_TOKEN" not in str(data.get("title", "")):
             errors.append(f"slide title readback mismatch: {data.get('title')!r}")
@@ -166,9 +174,17 @@ def _effect_errors(owner: str, action: str, params: dict, response: dict):
             errors.append(f"selected text readback mismatch: {data.get('text')!r}")
         elif action == "findPptText" and int(data.get("count", 0)) < 1:
             errors.append("text search returned no matches")
+        elif action == "getAnimations" and int(data.get("count", 0)) < 3:
+            errors.append(f"expected at least 3 animations, got {data.get('count')!r}")
     elif owner == "word":
-        if action == "getDocumentText" and "WORD_FIND_TOKEN" not in str(data.get("text", "")):
-            errors.append("document text readback does not contain WORD_FIND_TOKEN")
+        if action == "getActiveDocument" and data.get("name") != "word-main.docx":
+            errors.append(f"active document mismatch: {data.get('name')!r}")
+        elif action == "getDocumentText":
+            text = str(data.get("text", ""))
+            if "WORD_FIND_TOKEN" not in text:
+                errors.append("document text readback does not contain WORD_FIND_TOKEN")
+            if "WORD_BOOKMARK_TOKEN" not in text:
+                errors.append("bookmark replacement readback does not contain WORD_BOOKMARK_TOKEN")
         elif action == "getDocumentParagraphs" and int(data.get("count", 0)) < 1:
             errors.append("paragraph readback returned no paragraphs")
         elif action == "getSelectedText" and "WORD_SELECTION_TOKEN" not in str(data.get("text", "")):

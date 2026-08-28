@@ -104,7 +104,7 @@ function Convert-HexToOle($hex) {
         $r = [Convert]::ToInt32($h.Substring(0,2),16)
         $g = [Convert]::ToInt32($h.Substring(2,2),16)
         $b = [Convert]::ToInt32($h.Substring(4,2),16)
-        return [int]($b -bor ($g -shl 8) -bor ($r -shl 16))
+        return [int]($r -bor ($g -shl 8) -bor ($b -shl 16))
     } catch { return $null }
 }
 
@@ -185,8 +185,9 @@ function Exec-closePresentation($p) {
     $pres = Get-ActivePres
     if (-not $pres) { return @{success=$false; error="未找到演示文稿"} }
     if ($p.save -eq $true) { try { $pres.Save() } catch {} }
-    $pres.Close()
-    return @{success=$true; data=@{closed=$pres.Name}}
+    $closedName = $pres.Name
+    [void]$pres.Close()
+    return @{success=$true; data=@{closed=$closedName}}
 }
 
 function Exec-getOpenPresentations($p) {
@@ -200,8 +201,14 @@ function Exec-getOpenPresentations($p) {
 function Exec-switchPresentation($p) {
     $pres = Get-PresByName $p.name
     if (-not $pres) { return @{success=$false; error="未找到演示文稿: $($p.name)"} }
-    $pres.Activate() | Out-Null
-    return @{success=$true; data=@{name=$pres.Name}}
+    try {
+        [void]$pres.Windows.Item(1).Activate()
+        $active = Get-ActivePres
+        if (-not $active -or $active.Name -ne $p.name) {
+            return @{success=$false; error="切换演示文稿后活动目标不匹配: $($p.name)"}
+        }
+        return @{success=$true; data=@{name=$active.Name}}
+    } catch { return @{success=$false; error=$_.Exception.Message} }
 }
 
 function Exec-insertSlidesFromFile($p) {
@@ -274,8 +281,8 @@ function Exec-duplicateSlide($p) {
     $pres = Get-ActivePres
     $slide = Get-Slide $pres ([int]$p.slideIndex)
     if (-not $slide) { return @{success=$false; error="未找到幻灯片"} }
-    $newSlide = $slide.Duplicate()
-    return @{success=$true; data=@{slideIndex=$newSlide[0].SlideIndex; slideCount=$pres.Slides.Count}}
+    $newSlides = $slide.Duplicate()
+    return @{success=$true; data=@{slideIndex=$newSlides.Item(1).SlideIndex; slideCount=$pres.Slides.Count}}
 }
 
 function Exec-moveSlide($p) {
@@ -505,9 +512,11 @@ function Exec-create3DText($p) {
     $slide = Get-Slide $pres ([int]$p.slideIndex)
     if (-not $slide) { return @{success=$false; error="未找到幻灯片"} }
     try {
-        $tb = $slide.Shapes.AddTextbox(1, 100, 100, 400, 100)
-        $tb.TextFrame.TextRange.Text = $p.text
-        $tb.TextEffect.PresetThreeDFormat = 1
+        $tb = $slide.Shapes.AddTextEffect(0, $p.text, "微软雅黑", 32, $false, $false, 100, 100)
+        try {
+            $tb.ThreeD.Visible = $true
+            $tb.ThreeD.Depth = 20
+        } catch {}
         return @{success=$true; data=@{shapeId=$tb.Id}}
     } catch { return @{success=$false; error=$_.Exception.Message} }
 }
@@ -624,7 +633,7 @@ function Exec-alignShapes($p) {
     try {
         $align = 1
         switch ($p.align) { "left" { $align=1 } "center" { $align=2 } "right" { $align=3 } "top" { $align=4 } "middle" { $align=5 } "bottom" { $align=6 } }
-        $slide.Shapes.Align($align, 0) | Out-Null
+        [void]$slide.Shapes.Range().Align($align, 0)
         return @{success=$true}
     } catch { return @{success=$false; error=$_.Exception.Message} }
 }
@@ -633,7 +642,7 @@ function Exec-distributeShapes($p) {
     $pres = Get-ActivePres
     $slide = Get-Slide $pres ([int]$p.slideIndex)
     if (-not $slide) { return @{success=$false; error="未找到幻灯片"} }
-    try { $slide.Shapes.Distribute((Convert-Distribution $p.distribute), 0) | Out-Null; return @{success=$true} } catch { return @{success=$false; error=$_.Exception.Message} }
+    try { [void]$slide.Shapes.Range().Distribute((Convert-Distribution $p.distribute), 0); return @{success=$true} } catch { return @{success=$false; error=$_.Exception.Message} }
 }
 
 function Exec-groupShapes($p) {
@@ -647,7 +656,7 @@ function Exec-duplicateShape($p) {
     $pres = Get-ActivePres
     $slide = Get-Slide $pres ([int]$p.slideIndex)
     if (-not $slide) { return @{success=$false; error="未找到幻灯片"} }
-    try { $ns = (Get-ShapeById $slide ([int]$p.shapeIndex)).Duplicate(); return @{success=$true; data=@{shapeId=$ns[0].Id}} } catch { return @{success=$false; error=$_.Exception.Message} }
+    try { $newShapes = (Get-ShapeById $slide ([int]$p.shapeIndex)).Duplicate(); return @{success=$true; data=@{shapeId=$newShapes.Item(1).Id}} } catch { return @{success=$false; error=$_.Exception.Message} }
 }
 
 function Exec-setShapeZOrder($p) {
@@ -661,7 +670,7 @@ function Exec-smartDistribute($p) {
     $pres = Get-ActivePres
     $slide = Get-Slide $pres ([int]$p.slideIndex)
     if (-not $slide) { return @{success=$false; error="未找到幻灯片"} }
-    try { $slide.Shapes.Distribute((Convert-Distribution $p.distribute), 0) | Out-Null; return @{success=$true} } catch { return @{success=$false; error=$_.Exception.Message} }
+    try { [void]$slide.Shapes.Range().Distribute((Convert-Distribution $p.distribute), 0); return @{success=$true} } catch { return @{success=$false; error=$_.Exception.Message} }
 }
 
 # ---------- 图片 ----------
@@ -853,7 +862,7 @@ function Exec-addAnimation($p) {
     try {
         $sp = (Get-ShapeById $slide ([int]$p.shapeIndex))
         $eff = $slide.TimeLine.MainSequence.AddEffect($sp, 1)  # ppEffectAppear
-        return @{success=$true; data=@{effectId=$eff.EntryEffect}}
+        return @{success=$true; data=@{effectId=$slide.TimeLine.MainSequence.Count}}
     } catch { return @{success=$false; error=$_.Exception.Message} }
 }
 
@@ -1042,14 +1051,21 @@ function Exec-setBackgroundGradient($p) {
     $pres = Get-ActivePres
     $slide = Get-Slide $pres ([int]$p.slideIndex)
     if (-not $slide) { return @{success=$false; error="未找到幻灯片"} }
-    try { $slide.Background.Fill.Type = 1; return @{success=$true} } catch { return @{success=$false; error=$_.Exception.Message} }
+    try {
+        $slide.FollowMasterBackground = $false
+        $fill = $slide.Background.Fill
+        $fill.ForeColor.RGB = Convert-HexToOle "#F2F2F2"
+        $fill.BackColor.RGB = Convert-HexToOle "#D9EAF7"
+        [void]$fill.TwoColorGradient(1, 1)
+        return @{success=$true}
+    } catch { return @{success=$false; error=$_.Exception.Message} }
 }
 
 function Exec-setBackgroundImage($p) {
     $pres = Get-ActivePres
     $slide = Get-Slide $pres ([int]$p.slideIndex)
     if (-not $slide) { return @{success=$false; error="未找到幻灯片"} }
-    try { $slide.Background.Fill.UserPicture($p.imagePath); return @{success=$true} } catch { return @{success=$false; error=$_.Exception.Message} }
+    try { $slide.FollowMasterBackground = $false; [void]$slide.Background.Fill.UserPicture($p.imagePath); return @{success=$true} } catch { return @{success=$false; error=$_.Exception.Message} }
 }
 
 # ---------- 背景页脚3D ----------
@@ -1057,25 +1073,42 @@ function Exec-setBackgroundColor($p) {
     $pres = Get-ActivePres
     $slide = Get-Slide $pres ([int]$p.slideIndex)
     if (-not $slide) { return @{success=$false; error="未找到幻灯片"} }
-    try { $ole = Convert-HexToOle $p.color; $slide.Background.Fill.ForeColor.RGB = $ole; return @{success=$true} } catch { return @{success=$false; error=$_.Exception.Message} }
+    try { $slide.FollowMasterBackground = $false; $ole = Convert-HexToOle $p.color; $slide.Background.Fill.ForeColor.RGB = $ole; return @{success=$true} } catch { return @{success=$false; error=$_.Exception.Message} }
 }
 
 function Exec-setSlideNumber($p) {
     $pres = Get-ActivePres
     if (-not $pres) { return @{success=$false; error="无活动演示文稿"} }
-    try { $pres.SlideNumber.Show = if ($p.show) { $true } else { $false }; return @{success=$true} } catch { return @{success=$false; error=$_.Exception.Message} }
+    try {
+        $show = if ($p.show) { $true } else { $false }
+        foreach ($slide in $pres.Slides) { $slide.HeadersFooters.SlideNumber.Visible = $show }
+        return @{success=$true}
+    } catch { return @{success=$false; error=$_.Exception.Message} }
 }
 
 function Exec-setPptFooter($p) {
     $pres = Get-ActivePres
     if (-not $pres) { return @{success=$false; error="无活动演示文稿"} }
-    try { $pres.Footers.Item(1).Text = $p.text; return @{success=$true} } catch { return @{success=$false; error=$_.Exception.Message} }
+    try {
+        foreach ($slide in $pres.Slides) {
+            $slide.HeadersFooters.Footer.Visible = $true
+            $slide.HeadersFooters.Footer.Text = $p.text
+        }
+        return @{success=$true}
+    } catch { return @{success=$false; error=$_.Exception.Message} }
 }
 
 function Exec-setPptDateTime($p) {
     $pres = Get-ActivePres
     if (-not $pres) { return @{success=$false; error="无活动演示文稿"} }
-    try { $pres.Footers.Item(2).Text = $p.text; return @{success=$true} } catch { return @{success=$false; error=$_.Exception.Message} }
+    try {
+        foreach ($slide in $pres.Slides) {
+            $slide.HeadersFooters.DateAndTime.Visible = $true
+            $slide.HeadersFooters.DateAndTime.UseFormat = $false
+            $slide.HeadersFooters.DateAndTime.Text = $p.text
+        }
+        return @{success=$true}
+    } catch { return @{success=$false; error=$_.Exception.Message} }
 }
 
 function Exec-set3DRotation($p) {
@@ -1174,8 +1207,19 @@ function Exec-reconnect($p) {
     }
     return @{success=$false; error="重连失败：WPS 演示可能已退出，请先打开 WPS 演示"}
 }
-function Exec-getSelectedText($p) { try { return @{success=$true; data=@{text=$global:ppt.Selection.Text}} } catch { return @{success=$false; error=$_.Exception.Message} } }
-function Exec-setSelectedText($p) { try { $global:ppt.Selection.Text = $p.text; return @{success=$true} } catch { return @{success=$false; error=$_.Exception.Message} } }
+function Exec-getSelectedText($p) {
+    try {
+        $text = $global:ppt.ActiveWindow.Selection.TextRange.Text
+        if ($null -eq $text) { $text = "" }
+        return @{success=$true; data=@{text=[string]$text}}
+    } catch { return @{success=$false; error=$_.Exception.Message} }
+}
+function Exec-setSelectedText($p) {
+    try {
+        $global:ppt.ActiveWindow.Selection.TextRange.Text = $p.text
+        return @{success=$true}
+    } catch { return @{success=$false; error=$_.Exception.Message} }
+}
 function Exec-getAppInfo($p) { try { return @{success=$true; data=@{app="WPS演示"; version=$global:ppt.Version}} } catch { return @{success=$false; error=$_.Exception.Message} } }
 
 # ==================== 主循环（必须位于所有 Exec-* 函数定义之后） ====================
@@ -1205,7 +1249,8 @@ while ($true) {
                 error="没有活动演示文稿；请先创建或打开演示文稿"
             }
         } else {
-            $result = & "Exec-$action" $params
+            $actionOutput = @(& "Exec-$action" $params)
+            $result = $actionOutput[-1]
         }
         $sw.Stop()
         if ($null -eq $result) { $result = @{success=$true; data=$null} }

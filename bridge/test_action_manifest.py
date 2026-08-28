@@ -304,6 +304,83 @@ class ActionManifestValidationTests(unittest.TestCase):
         self.assertIn("[System.IO.File]::Copy($backupPath, $fullPath, $true)", script)
         self.assertEqual(120, wps_excel.EXEC_TIMEOUT)
 
+    def test_excel_copy_sheet_keeps_the_copy_in_the_active_workbook(self):
+        script = wps_excel.PS_BRIDGE_SCRIPT
+
+        self.assertNotRegex(
+            script,
+            re.compile(
+                r"function Exec-copySheet\(\$p\).*?\$sheet\.Copy\(\)",
+                re.DOTALL,
+            ),
+        )
+
+    def test_excel_action_response_ignores_com_pipeline_output(self):
+        script = wps_excel.PS_BRIDGE_SCRIPT
+
+        self.assertNotIn('$result = & "Exec-$action" $params', script)
+        self.assertRegex(
+            script,
+            re.compile(
+                r'\$actionOutput = @\(& "Exec-\$action" \$params\)\s*'
+                r'\$result = \$actionOutput\[-1\]',
+                re.DOTALL,
+            ),
+        )
+
+    def test_ppt_and_word_action_responses_ignore_com_pipeline_output(self):
+        for owner, script in (
+            ("ppt", wps_ppt.PS_BRIDGE_SCRIPT),
+            ("word", wps_word.PS_BRIDGE_SCRIPT),
+        ):
+            with self.subTest(owner=owner):
+                self.assertNotIn('$result = & "Exec-$action" $params', script)
+                self.assertRegex(
+                    script,
+                    re.compile(
+                        r'\$actionOutput = @\(& "Exec-\$action" \$params\)\s*'
+                        r'\$result = \$actionOutput\[-1\]',
+                        re.DOTALL,
+                    ),
+                )
+
+    def test_excel_text_actions_use_valid_powershell_and_range_properties(self):
+        script = wps_excel.PS_BRIDGE_SCRIPT
+
+        self.assertNotIn('if ($p.matchCase) { true }', script)
+        self.assertIn('if ($p.matchCase) { $true }', script)
+        self.assertNotIn('$global:excel.Selection.Text = $p.text', script)
+        self.assertIn('$global:excel.Selection.Value2 = $p.text', script)
+
+    def test_excel_formatting_uses_wps_available_color_and_window_paths(self):
+        script = wps_excel.PS_BRIDGE_SCRIPT
+
+        self.assertIn('function Convert-HexToOle($hex)', script)
+        self.assertNotIn('[System.Drawing.ColorTranslator]', script)
+        self.assertNotIn('$wb.ActiveWindow.', script)
+        self.assertIn('$global:excel.ActiveWindow.FreezePanes', script)
+        self.assertIn('$global:excel.ActiveWindow.Zoom', script)
+
+    def test_excel_style_and_conditional_format_use_complete_com_arguments(self):
+        script = wps_excel.PS_BRIDGE_SCRIPT
+
+        self.assertIn('$style = $wb.Styles.Item($p.style)', script)
+        self.assertIn('$sheet.Range($p.range).set_Style($style)', script)
+        self.assertIn(
+            '[void]$range.FormatConditions.Add(1, 5, $p.condition, [Type]::Missing)',
+            script,
+        )
+        self.assertRegex(
+            script,
+            re.compile(
+                r"function Exec-copySheet\(\$p\).*?"
+                r"\[void\]\$sheet\.Copy\(\[Type\]::Missing, "
+                r"\$wb\.Sheets\.Item\(\$wb\.Sheets\.Count\)\).*?"
+                r"\$newSheet = \$wb\.Sheets\.Item\(\$wb\.Sheets\.Count\)",
+                re.DOTALL,
+            ),
+        )
+
     def test_ppt_contracts_preserve_active_presentation_and_targets(self):
         catalog = ActionCatalog.from_path()
         script = wps_ppt.PS_BRIDGE_SCRIPT
@@ -368,6 +445,53 @@ class ActionManifestValidationTests(unittest.TestCase):
             ),
         )
 
+    def test_ppt_write_results_use_stable_pre_effect_values_and_one_based_ids(self):
+        script = wps_ppt.PS_BRIDGE_SCRIPT
+
+        self.assertIn('$closedName = $pres.Name', script)
+        self.assertIn('[void]$pres.Close()', script)
+        self.assertIn('data=@{closed=$closedName}', script)
+        self.assertNotIn('$newSlide[0].SlideIndex', script)
+        self.assertIn('$newSlides.Item(1).SlideIndex', script)
+        self.assertNotIn('$ns[0].Id', script)
+        self.assertIn('$newShapes.Item(1).Id', script)
+        self.assertNotIn('effectId=$eff.EntryEffect', script)
+        self.assertIn('effectId=$slide.TimeLine.MainSequence.Count', script)
+
+    def test_ppt_targeting_and_shape_operations_use_wps_object_paths(self):
+        script = wps_ppt.PS_BRIDGE_SCRIPT
+
+        self.assertNotIn('$pres.Activate()', script)
+        self.assertIn('$pres.Windows.Item(1).Activate()', script)
+        self.assertIn('$active = Get-ActivePres', script)
+        self.assertIn('$global:ppt.ActiveWindow.Selection.TextRange.Text', script)
+        self.assertNotIn('$global:ppt.Selection.Text', script)
+        self.assertIn('$slide.Shapes.Range().Align($align, 0)', script)
+        self.assertIn(
+            '$slide.Shapes.Range().Distribute((Convert-Distribution $p.distribute), 0)',
+            script,
+        )
+
+    def test_ppt_3d_background_and_footer_actions_use_slide_level_objects(self):
+        script = wps_ppt.PS_BRIDGE_SCRIPT
+
+        self.assertIn(
+            'return [int]($r -bor ($g -shl 8) -bor ($b -shl 16))',
+            script,
+        )
+        self.assertIn('$slide.Shapes.AddTextEffect(', script)
+        self.assertNotIn('$tb.TextEffect.PresetThreeDFormat', script)
+        self.assertIn('$slide.FollowMasterBackground = $false', script)
+        self.assertIn('[void]$fill.TwoColorGradient(1, 1)', script)
+        self.assertNotIn('$slide.Background.Fill.Type =', script)
+        self.assertIn('$slide.HeadersFooters.Footer.Visible = $true', script)
+        self.assertIn('$slide.HeadersFooters.Footer.Text = $p.text', script)
+        self.assertIn('$slide.HeadersFooters.DateAndTime.Visible = $true', script)
+        self.assertIn('$slide.HeadersFooters.DateAndTime.Text = $p.text', script)
+        self.assertIn('$slide.HeadersFooters.SlideNumber.Visible = $show', script)
+        self.assertNotIn('$pres.Footers', script)
+        self.assertNotIn('$pres.SlideNumber', script)
+
     def test_word_contracts_preserve_active_document_and_targets(self):
         catalog = ActionCatalog.from_path()
         script = wps_word.PS_BRIDGE_SCRIPT
@@ -418,6 +542,26 @@ class ActionManifestValidationTests(unittest.TestCase):
         self.assertIn("OVERWRITE_RESTORE_FAILED", script)
         self.assertIn("[System.IO.File]::Copy($backupPath, $fullPath, $true)", script)
         self.assertEqual(120, wps_word.EXEC_TIMEOUT)
+
+    def test_word_switch_bookmark_and_style_paths_preserve_document_state(self):
+        script = wps_word.PS_BRIDGE_SCRIPT
+
+        self.assertIn(
+            'return [int]($r -bor ($g -shl 8) -bor ($b -shl 16))',
+            script,
+        )
+        self.assertNotIn('$doc.Activate()', script)
+        self.assertIn('$doc.Windows.Item(1).Activate()', script)
+        self.assertIn('$active = Get-ActiveDoc', script)
+        self.assertIn('切换文档后活动目标不匹配', script)
+        self.assertIn('$rng = $doc.Range($insertAt, $insertAt)', script)
+        self.assertIn('$start = [int]$bookmark.Range.Start', script)
+        self.assertIn('$end = [int]$bookmark.Range.End', script)
+        self.assertIn('$replacement = $doc.Range($start, $end)', script)
+        self.assertIn('[void]$doc.Bookmarks.Add($p.name, $bookmarkRange)', script)
+        self.assertIn('function Resolve-WordStyle($doc, $name)', script)
+        self.assertIn('"heading 1" { return $doc.Styles.Item(-2) }', script)
+        self.assertIn('$rng.set_Style($style)', script)
 
 
 if __name__ == "__main__":

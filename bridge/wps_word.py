@@ -88,7 +88,7 @@ function Convert-HexToOle($hex) {
         $r = [Convert]::ToInt32($h.Substring(0,2),16)
         $g = [Convert]::ToInt32($h.Substring(2,2),16)
         $b = [Convert]::ToInt32($h.Substring(4,2),16)
-        return [int]($b -bor ($g -shl 8) -bor ($r -shl 16))
+        return [int]($r -bor ($g -shl 8) -bor ($b -shl 16))
     } catch { return $null }
 }
 
@@ -106,6 +106,17 @@ function Resolve-Range($doc, $range) {
     [void]$r.Find.Execute($range, $false, $false, $false, $false, $false, $true, 1, $false, "", 0)
     if ($r.Find.Found) { return $r }
     return $doc.Content
+}
+
+function Resolve-WordStyle($doc, $name) {
+    if ($null -eq $name -or $name -eq '') { throw "缺少样式名" }
+    switch ($name.ToString().ToLowerInvariant()) {
+        "normal" { return $doc.Styles.Item(-1) }
+        "heading 1" { return $doc.Styles.Item(-2) }
+        "heading 2" { return $doc.Styles.Item(-3) }
+        "heading 3" { return $doc.Styles.Item(-4) }
+        default { return $doc.Styles.Item($name) }
+    }
 }
 
 # ==================== Action 实现函数 ====================
@@ -136,7 +147,8 @@ function Exec-applyStyle($p) {
     if (-not $doc) { return @{success=$false; error="无活动文档"} }
     try {
         $rng = Resolve-Range $doc $p.range
-        $rng.Style = $p.style_name
+        $style = Resolve-WordStyle $doc $p.style_name
+        $rng.set_Style($style)
         return @{success=$true}
     } catch { return @{success=$false; error=$_.Exception.Message} }
 }
@@ -172,7 +184,7 @@ function Exec-insertText($p) {
         else { $rng.Collapse(0) }  # 末尾
         if ($p.new_paragraph -eq $true) { $rng.InsertParagraphAfter() }
         $rng.InsertAfter($p.text)
-        if ($p.style) { $rng.Style = $p.style }
+        if ($p.style) { $style = Resolve-WordStyle $doc $p.style; $rng.set_Style($style) }
         return @{success=$true; data=@{inserted=$true}}
     } catch { return @{success=$false; error=$_.Exception.Message} }
 }
@@ -232,8 +244,10 @@ function Exec-insertBookmark($p) {
     $doc = Get-ActiveDoc
     if (-not $doc) { return @{success=$false; error="无活动文档"} }
     try {
-        $rng = $doc.Content; $rng.Collapse(0)
-        $doc.Bookmarks.Add($p.name, $rng) | Out-Null
+        $content = $doc.Content
+        $insertAt = [Math]::Max([int]$content.Start, [int]$content.End - 1)
+        $rng = $doc.Range($insertAt, $insertAt)
+        [void]$doc.Bookmarks.Add($p.name, $rng)
         return @{success=$true}
     } catch { return @{success=$false; error=$_.Exception.Message} }
 }
@@ -289,8 +303,14 @@ function Exec-getOpenDocuments($p) {
 function Exec-switchDocument($p) {
     $doc = Get-DocByName $p.name
     if (-not $doc) { return @{success=$false; error="未找到文档: $($p.name)"} }
-    $doc.Activate() | Out-Null
-    return @{success=$true; data=@{name=$doc.Name}}
+    try {
+        [void]$doc.Windows.Item(1).Activate()
+        $active = Get-ActiveDoc
+        if (-not $active -or $active.Name -ne $p.name) {
+            return @{success=$false; error="切换文档后活动目标不匹配: $($p.name)"}
+        }
+        return @{success=$true; data=@{name=$active.Name}}
+    } catch { return @{success=$false; error=$_.Exception.Message} }
 }
 
 function Exec-createDocument($p) {
@@ -396,7 +416,13 @@ function Exec-replaceBookmarkContent($p) {
     if (-not $doc) { return @{success=$false; error="无活动文档"} }
     try {
         if (-not $doc.Bookmarks.Exists($p.name)) { return @{success=$false; error="书签不存在: $($p.name)"} }
-        $doc.Bookmarks.Item($p.name).Range.Text = $p.text
+        $bookmark = $doc.Bookmarks.Item($p.name)
+        $start = [int]$bookmark.Range.Start
+        $end = [int]$bookmark.Range.End
+        $replacement = $doc.Range($start, $end)
+        $replacement.Text = $p.text
+        $bookmarkRange = $doc.Range($start, $start + $p.text.Length)
+        [void]$doc.Bookmarks.Add($p.name, $bookmarkRange)
         return @{success=$true}
     } catch { return @{success=$false; error=$_.Exception.Message} }
 }
@@ -520,7 +546,8 @@ while ($true) {
                 error="没有活动文字文档；请先创建或打开文字文档"
             }
         } else {
-            $result = & "Exec-$action" $params
+            $actionOutput = @(& "Exec-$action" $params)
+            $result = $actionOutput[-1]
         }
         $sw.Stop()
         if ($null -eq $result) { $result = @{success=$true; data=$null} }

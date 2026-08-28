@@ -79,6 +79,69 @@ class WindowsWpsFullSuiteTest(unittest.TestCase):
 
         self.assertEqual([], errors)
 
+    def test_slide_title_readback_runs_after_the_title_write(self):
+        declared = list(iter_declared_actions())
+
+        self.assertLess(
+            declared.index(("ppt", "setSlideTitle")),
+            declared.index(("ppt", "getSlideTitle")),
+        )
+
+    def test_stateful_write_readbacks_run_after_their_writes(self):
+        declared = list(iter_declared_actions())
+
+        for owner, write, readback in (
+            ("excel", "copySheet", "getSheetList"),
+            ("ppt", "addAnimation", "getAnimations"),
+            ("ppt", "addAnimationPreset", "getAnimations"),
+            ("ppt", "addEmphasisAnimation", "getAnimations"),
+            ("word", "switchDocument", "getActiveDocument"),
+            ("word", "replaceBookmarkContent", "getDocumentText"),
+        ):
+            with self.subTest(owner=owner, write=write, readback=readback):
+                self.assertLess(
+                    declared.index((owner, write)),
+                    declared.index((owner, readback)),
+                )
+
+    def test_stateful_effect_validation_rejects_missing_write_effects(self):
+        missing_copy = _effect_errors(
+            "excel",
+            "getSheetList",
+            {},
+            {"success": True, "data": {"sheets": [{"name": "SuiteRenamed"}]}},
+        )
+        intact_word = _effect_errors(
+            "word",
+            "getDocumentText",
+            {},
+            {"success": True, "data": {"text": "WORD_FIND_TOKEN WORD_BOOKMARK_TOKEN"}},
+        )
+        missing_bookmark = _effect_errors(
+            "word",
+            "getDocumentText",
+            {},
+            {"success": True, "data": {"text": "WORD_FIND_TOKEN"}},
+        )
+        wrong_active_doc = _effect_errors(
+            "word",
+            "getActiveDocument",
+            {},
+            {"success": True, "data": {"name": "word-secondary.docx"}},
+        )
+        too_few_animations = _effect_errors(
+            "ppt",
+            "getAnimations",
+            {},
+            {"success": True, "data": {"count": 2, "animations": [{}, {}]}},
+        )
+
+        self.assertTrue(missing_copy)
+        self.assertEqual([], intact_word)
+        self.assertTrue(missing_bookmark)
+        self.assertTrue(wrong_active_doc)
+        self.assertTrue(too_few_animations)
+
 
 if __name__ == "__main__":
     unittest.main()

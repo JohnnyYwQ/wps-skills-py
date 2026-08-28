@@ -111,6 +111,19 @@ function ConvertToA1($col) {
     return $s
 }
 
+# 十六进制颜色 (#RRGGBB) -> Office OLE_COLOR (0x00BBGGRR)。
+function Convert-HexToOle($hex) {
+    if ($null -eq $hex -or $hex -eq '') { return $null }
+    $h = $hex.ToString().Trim().Replace('#','')
+    if ($h.Length -ne 6) { return $null }
+    try {
+        $r = [Convert]::ToInt32($h.Substring(0,2),16)
+        $g = [Convert]::ToInt32($h.Substring(2,2),16)
+        $b = [Convert]::ToInt32($h.Substring(4,2),16)
+        return [int]($r -bor ($g -shl 8) -bor ($b -shl 16))
+    } catch { return $null }
+}
+
 ''' + render_chart_type_converter() + r'''
 function Exec-getOpenWorkbooks($p) {
     $names = @()
@@ -268,8 +281,7 @@ function Exec-setPrintArea($p) {
 }
 
 function Exec-setZoom($p) {
-    $wb = $global:excel.ActiveWorkbook
-    $wb.ActiveWindow.Zoom = $p.percent
+    $global:excel.ActiveWindow.Zoom = $p.percent
     return @{success=$true}
 }
 
@@ -395,7 +407,7 @@ function Exec-findReplace($p) {
     $wb = $global:excel.ActiveWorkbook
     $sheet = $wb.ActiveSheet
     $usedRange = $sheet.UsedRange
-    $matchCase = if ($p.matchCase) { true } else { $false }
+    $matchCase = if ($p.matchCase) { $true } else { $false }
     $what = $p.find
     $replacement = $p.replace
     $found = $usedRange.Find($what, [Type]::Missing, -4162, 1, 1, 1, $matchCase)
@@ -444,8 +456,10 @@ function Exec-addConditionalFormat($p) {
     $wb = $global:excel.ActiveWorkbook
     $sheet = $wb.ActiveSheet
     $range = $sheet.Range($p.range)
-    $range.FormatConditions.Delete()
-    $range.FormatConditions.Add(1, $p.condition, [Type]::Missing)
+    [void]$range.FormatConditions.Delete()
+    # xlCellValue + xlGreater + Formula1.  The previous three-argument form
+    # treated condition as the operator and omitted the required formula.
+    [void]$range.FormatConditions.Add(1, 5, $p.condition, [Type]::Missing)
     return @{success=$true}
 }
 
@@ -637,7 +651,7 @@ function Exec-renameSheet($p) {
 function Exec-copySheet($p) {
     $wb = $global:excel.ActiveWorkbook
     $sheet = $wb.Sheets.Item($p.name)
-    $newSheet = $sheet.Copy()
+    [void]$sheet.Copy([Type]::Missing, $wb.Sheets.Item($wb.Sheets.Count))
     $newSheet = $wb.Sheets.Item($wb.Sheets.Count)
     if ($p.newName) { $newSheet.Name = $p.newName }
     return @{success=$true; data=@{sourceName=$p.name; newName=$newSheet.Name; index=($newSheet.Index-1)}}
@@ -712,9 +726,9 @@ function Exec-freezePanes($p) {
         $row = if ($p.row) { $p.row } else { 1 }
         $col = if ($p.column) { $p.column } else { 1 }
         $sheet.Cells.Item($row + 1, $col + 1).Select()
-        $wb.ActiveWindow.FreezePanes = $true
+        $global:excel.ActiveWindow.FreezePanes = $true
     } else {
-        $wb.ActiveWindow.FreezePanes = $false
+        $global:excel.ActiveWindow.FreezePanes = $false
     }
     return @{success=$true}
 }
@@ -755,8 +769,8 @@ function Exec-setCellFormat($p) {
     if ($null -ne $f.italic) { $range.Font.Italic = $f.italic }
     if ($null -ne $f.fontSize) { $range.Font.Size = $f.fontSize }
     if ($null -ne $f.fontName) { $range.Font.Name = $f.fontName }
-    if ($null -ne $f.fontColor) { $range.Font.Color = [System.Drawing.ColorTranslator]::ToOle([System.Drawing.Color]::FromArgb([Convert]::ToInt32($f.fontColor.Substring(1,2),16), [Convert]::ToInt32($f.fontColor.Substring(3,2),16), [Convert]::ToInt32($f.fontColor.Substring(5,2),16))) }
-    if ($null -ne $f.bgColor) { $range.Interior.Color = [System.Drawing.ColorTranslator]::ToOle([System.Drawing.Color]::FromArgb([Convert]::ToInt32($f.bgColor.Substring(1,2),16), [Convert]::ToInt32($f.bgColor.Substring(3,2),16), [Convert]::ToInt32($f.bgColor.Substring(5,2),16))) }
+    if ($null -ne $f.fontColor) { $range.Font.Color = Convert-HexToOle $f.fontColor }
+    if ($null -ne $f.bgColor) { $range.Interior.Color = Convert-HexToOle $f.bgColor }
     if ($null -ne $f.underline) { $range.Font.Underline = if ($f.underline) { 2 } else { -4142 } }
     if ($null -ne $f.horizontalAlignment) {
         $align = switch ($f.horizontalAlignment) { "left" {1} "center" {-4108} "right" {-4152} default {-4131} }
@@ -773,7 +787,8 @@ function Exec-setCellFormat($p) {
 function Exec-setCellStyle($p) {
     $wb = $global:excel.ActiveWorkbook
     $sheet = if ($p.sheet) { $wb.Sheets.Item($p.sheet) } else { $wb.ActiveSheet }
-    $sheet.Range($p.range).Style = $p.style
+    $style = $wb.Styles.Item($p.style)
+    $sheet.Range($p.range).set_Style($style)
     return @{success=$true}
 }
 
@@ -782,10 +797,7 @@ function Exec-setBorder($p) {
     $sheet = if ($p.sheet) { $wb.Sheets.Item($p.sheet) } else { $wb.ActiveSheet }
     $range = $sheet.Range($p.range)
     $style = switch ($p.borderStyle) { "thin" {1} "medium" {-4138} "thick" {4} "double" {-4119} "none" {-4142} default {1} }
-    $color = if ($p.color) { 
-        $c = $p.color
-        [System.Drawing.ColorTranslator]::ToOle([System.Drawing.Color]::FromArgb([Convert]::ToInt32($c.Substring(1,2),16), [Convert]::ToInt32($c.Substring(3,2),16), [Convert]::ToInt32($c.Substring(5,2),16)))
-    } else { 0 }
+    $color = if ($p.color) { Convert-HexToOle $p.color } else { 0 }
     $borders = $range.Borders
     $pos = switch ($p.position) { "top" {5} "bottom" {9} "left" {7} "right" {10} "outline" {-4120} default {1} }
     if ($pos -eq 1) { $borders.Item(1).LineStyle = $style; $borders.Item(1).Color = $color }
@@ -1023,7 +1035,7 @@ function Exec-reconnect($p) {
     return @{success=$false; error="重连失败：WPS 表格可能已退出，请先打开 WPS 表格"}
 }
 function Exec-getSelectedText($p) { try { return @{success=$true; data=@{text=$global:excel.Selection.Text}} } catch { return @{success=$false; error=$_.Exception.Message} } }
-function Exec-setSelectedText($p) { try { $global:excel.Selection.Text = $p.text; return @{success=$true} } catch { return @{success=$false; error=$_.Exception.Message} } }
+function Exec-setSelectedText($p) { try { $global:excel.Selection.Value2 = $p.text; return @{success=$true} } catch { return @{success=$false; error=$_.Exception.Message} } }
 function Exec-getAppInfo($p) { try { return @{success=$true; data=@{app="WPS表格"; version=$global:excel.Version}} } catch { return @{success=$false; error=$_.Exception.Message} } }
 
 function Get-ExcelActiveWorkbook {
@@ -1060,7 +1072,11 @@ while ($true) {
                 error="没有活动工作簿；请先创建或打开工作簿"
             }
         } else {
-            $result = & "Exec-$action" $params
+            # COM methods frequently emit their own return value to PowerShell's
+            # success pipeline.  Every public handler ends with its explicit
+            # Action response, so only that final value crosses the line-RPC seam.
+            $actionOutput = @(& "Exec-$action" $params)
+            $result = $actionOutput[-1]
         }
         $sw.Stop()
         # 规范化结果，确保始终是带 reqId 的 hashtable，避免 ConvertTo-Json 产出空串/截断
