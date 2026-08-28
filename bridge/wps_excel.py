@@ -3,7 +3,7 @@
 WPS Excel 控制器 - 纯 Python 实现
 通过 COM 自动化（Windows）或命令行（Linux）控制 WPS Excel。
 
-不依赖 MCP，不依赖外网，不依赖 Node.js/JS 环境。
+运行时只使用仓内源码与 Python 标准库。
 Windows: 通过 subprocess 调用 PowerShell COM（PowerShell 是 Windows 内置组件）
 Linux:   通过 subprocess 调用 WPS 命令行工具
 

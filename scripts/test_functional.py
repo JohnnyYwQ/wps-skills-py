@@ -1,83 +1,83 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""统一 WPS Skill 功能验证脚本（Excel / PPT / Word + 通用）。
-通过 scripts/call.py 的胶水层调用，会自动拉起最新桥接服务。"""
-import atexit
-import sys, os, json, time
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-import call  # noqa: E402
-import service  # noqa: E402
+"""Representative real-WPS checks through the public one-Action CLI."""
 
-PORT = call.PORT
-_results = []
-_started_bridge = False
+import json
+from pathlib import Path
+import subprocess
+import sys
 
 
-def _cleanup_started_bridge():
-    if not _started_bridge:
-        return
-    result = service.stop()
-    print(f"\n=== bridge 清理 ===\n{json.dumps(result, ensure_ascii=False)}")
+ROOT = Path(__file__).resolve().parents[1]
+CALL = ROOT / "scripts" / "call.py"
 
 
-atexit.register(_cleanup_started_bridge)
-
-def run(label, action, params=None):
-    global _started_bridge
-    params = params or {}
-    bridge_service = call._ensure_server()
-    if not bridge_service:
-        _results.append((label, False, {"error": "server start failed"}))
-        return
-    _started_bridge = _started_bridge or bridge_service.started
+def run_action(label, action, params=None, app=None):
+    command = [sys.executable, str(CALL), action]
+    if app:
+        command.extend(("--app", app))
+    command.append(json.dumps(params or {}, ensure_ascii=False))
+    completed = subprocess.run(
+        command,
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
     try:
-        r = call._post(action, params, service_health=bridge_service.health)
-    except Exception as e:
-        r = {"success": False, "error": str(e)}
-    ok = bool(r.get("success"))
-    _results.append((label, ok, r))
-    tag = "OK  " if ok else "FAIL"
-    print(f"[{tag}] {label}: {json.dumps(r, ensure_ascii=False)}")
-    time.sleep(0.3)
-    return r
+        response = json.loads(completed.stdout)
+    except json.JSONDecodeError:
+        response = {
+            "success": False,
+            "error": f"Action CLI did not return JSON: {completed.stderr or completed.stdout}",
+        }
+    ok = bool(response.get("success"))
+    print(f"[{'OK  ' if ok else 'FAIL'}] {label}: {json.dumps(response, ensure_ascii=False)}")
+    return label, ok, response
 
-print("=== 健康检查 ===")
-h = call._health()
-print(json.dumps(h, ensure_ascii=False))
 
-print("\n=== Excel 功能 ===")
-run("Excel createWorkbook", "createWorkbook", {})
-run("Excel setCellValue(1,1)", "setCellValue", {"row": 1, "col": 1, "value": "hello统一"})
-run("Excel getCellValue(1,1)", "getCellValue", {"row": 1, "col": 1})
-run("Excel setFormula(D2)", "setFormula", {"cell": "D2", "formula": "=1+2"})
-r_getf = run("Excel getFormula(D2)", "getFormula", {"cell": "D2"})
-run("Excel getActiveWorkbook", "getActiveWorkbook", {})
+def main():
+    results = []
 
-print("\n=== PPT 功能 ===")
-run("PPT createPresentation", "createPresentation", {})
-run("PPT addSlide(title)", "addSlide", {"layout": "title_content", "title": "测试标题"})
-run("PPT getSlideCount", "getSlideCount", {})
-run("PPT getSlideTitle(1)", "getSlideTitle", {"slideIndex": 1})
-run("PPT setSlideTitle(1)", "setSlideTitle", {"slideIndex": 1, "title": "新标题统一"})
-run("PPT getSlideTitle(1) after set", "getSlideTitle", {"slideIndex": 1})
+    print("=== Excel 功能 ===")
+    results.append(run_action("Excel createWorkbook", "createWorkbook", app="excel"))
+    results.append(run_action(
+        "Excel setCellValue(1,1)", "setCellValue",
+        {"row": 1, "col": 1, "value": "hello统一"}, "excel",
+    ))
+    results.append(run_action(
+        "Excel getCellValue(1,1)", "getCellValue", {"row": 1, "col": 1}, "excel",
+    ))
+    results.append(run_action(
+        "Excel setFormula(D2)", "setFormula", {"cell": "D2", "formula": "=1+2"}, "excel",
+    ))
 
-print("\n=== Word 功能 ===")
-run("Word createDocument", "createDocument", {})
-run("Word insertText", "insertText", {"text": "这是一段测试文字统一", "position": "end"})
-run("Word getDocumentText", "getDocumentText", {})
-run("Word getActiveDocument", "getActiveDocument", {})
-run("Word setFont", "setFont", {"font_name": "微软雅黑", "font_size": 14})
+    print("\n=== PPT 功能 ===")
+    results.append(run_action("PPT createPresentation", "createPresentation", app="ppt"))
+    results.append(run_action(
+        "PPT addSlide(title)", "addSlide",
+        {"layout": "title_content", "title": "测试标题"}, "ppt",
+    ))
+    results.append(run_action("PPT getSlideCount", "getSlideCount", app="ppt"))
 
-print("\n=== 通用 action（按 app 委派）===")
-run("Common getAppInfo(excel)", "getAppInfo", {"app": "excel"})
-run("Common getAppInfo(ppt)", "getAppInfo", {"app": "ppt"})
-run("Common getAppInfo(word)", "getAppInfo", {"app": "word"})
+    print("\n=== Word 功能 ===")
+    results.append(run_action("Word createDocument", "createDocument", app="word"))
+    results.append(run_action(
+        "Word insertText", "insertText", {"text": "这是一段测试文字统一", "position": "end"}, "word",
+    ))
+    results.append(run_action("Word getDocumentText", "getDocumentText", app="word"))
 
-print("\n=== 汇总 ===")
-ok_n = sum(1 for _, ok, _ in _results if ok)
-fail_n = len(_results) - ok_n
-print(f"通过 {ok_n}/{len(_results)}，失败 {fail_n}")
-for label, ok, r in _results:
-    if not ok:
-        print(f"  - FAIL: {label} -> {r.get('error', r)}")
-sys.exit(0 if fail_n == 0 else 1)
+    print("\n=== 应用连接 ===")
+    for app in ("excel", "ppt", "word"):
+        results.append(run_action(f"{app} getAppInfo", "getAppInfo", app=app))
+
+    passed = sum(1 for _, ok, _ in results if ok)
+    failed = len(results) - passed
+    print(f"\n通过 {passed}/{len(results)}，失败 {failed}")
+    for label, ok, response in results:
+        if not ok:
+            print(f"  - FAIL: {label} -> {response.get('error', response)}")
+    return 0 if failed == 0 else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

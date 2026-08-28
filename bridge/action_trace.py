@@ -180,12 +180,6 @@ def _remove_old_logs_unchecked(root: Path) -> None:
             except OSError:
                 pass
 
-        for path in root.glob("server-*.log"):
-            try:
-                if path.is_file() and not path.is_symlink() and path.stat().st_mtime < cutoff:
-                    path.unlink()
-            except (FileNotFoundError, OSError):
-                continue
     finally:
         try:
             marker.touch()
@@ -200,18 +194,6 @@ def _remove_old_logs(root: Path) -> Optional[str]:
         return None
     except Exception as exc:
         return f"过期日志清理失败: {type(exc).__name__}: {exc}"
-
-
-def server_log_path() -> Tuple[Optional[Path], Optional[str]]:
-    """返回后台桥接服务的普通 stdout/stderr 日志路径。"""
-    root, warning = _select_log_root()
-    if root is None:
-        return None, warning
-    cleanup_warning = _remove_old_logs(root)
-    if cleanup_warning:
-        warning = "；".join(part for part in (warning, cleanup_warning) if part)
-    day = datetime.now().strftime("%Y-%m-%d")
-    return root / f"server-{day}.log", warning
 
 
 def _truncate(value: str, limit: int) -> str:

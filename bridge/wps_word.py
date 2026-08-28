@@ -4,7 +4,7 @@ WPS Word 控制器 - 纯 Python 实现
 通过 COM 自动化（Windows）控制 WPS 文字（Kwps.Application）。
 
 与 wps_excel.py / wps_ppt.py 完全相同的可靠架构（reqId / 超时强杀 / BOM+ensure_ascii）。
-不依赖 MCP，不依赖外网，不依赖 Node.js/JS 环境。
+运行时只使用仓内源码与 Python 标准库。
 """
 
 import json

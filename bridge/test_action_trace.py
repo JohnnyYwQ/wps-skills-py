@@ -37,14 +37,14 @@ class ActionTraceTests(unittest.TestCase):
             {"WPS_TRACE_DIR": tmp},
             clear=False,
         ):
-            client = ActionTrace.start(component="call")
-            client.event("http.sent")
-            server = ActionTrace.resume(client.trace_id, component="server")
-            server.event("http.received")
+            cli = ActionTrace.start(component="call")
+            cli.event("cli.received")
+            runtime = ActionTrace.resume(cli.trace_id, component="runtime")
+            runtime.event("runtime.executed")
 
-            self.assertEqual(client.log_path, server.log_path)
-            rows = [json.loads(line) for line in client.log_path.read_text(encoding="utf-8").splitlines()]
-            self.assertEqual(["http.sent", "http.received"], [row["event"] for row in rows])
+            self.assertEqual(cli.log_path, runtime.log_path)
+            rows = [json.loads(line) for line in cli.log_path.read_text(encoding="utf-8").splitlines()]
+            self.assertEqual(["cli.received", "runtime.executed"], [row["event"] for row in rows])
 
     def test_info_mode_omits_debug_payload(self):
         with tempfile.TemporaryDirectory() as tmp, patch.dict(
@@ -129,10 +129,6 @@ class ActionTraceTests(unittest.TestCase):
             recent_file = recent_dir / "recent.jsonl"
             recent_file.write_text("{}\n", encoding="utf-8")
 
-            old_server_log = Path(tmp) / "server-2000-01-01.log"
-            old_server_log.write_text("old server output\n", encoding="utf-8")
-            os.utime(old_server_log, (old_time, old_time))
-
             unrelated_file = Path(tmp) / "keep-me.txt"
             unrelated_file.write_text("not a trace log\n", encoding="utf-8")
             os.utime(unrelated_file, (old_time, old_time))
@@ -140,7 +136,6 @@ class ActionTraceTests(unittest.TestCase):
             ActionTrace.start(component="call")
 
             self.assertFalse(old_file.exists())
-            self.assertFalse(old_server_log.exists())
             self.assertTrue(recent_file.exists())
             self.assertTrue(unrelated_file.exists())
 

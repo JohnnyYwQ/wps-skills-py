@@ -10,7 +10,7 @@ WPS PPT 控制器 - 纯 Python 实现
   - 将断开恢复策略交由 Action Runtime
   - 临时 .ps1 用 utf-8-sig(BOM)；命令用 ensure_ascii=True 跨管道传中文
 
-不依赖 MCP，不依赖外网，不依赖 Node.js/JS 环境。
+运行时只使用仓内源码与 Python 标准库。
 """
 
 import json

@@ -8,6 +8,32 @@ from scripts import install
 
 
 class InstallCheckTests(unittest.TestCase):
+    def test_windows_powershell_check_reports_an_available_executable(self):
+        output = io.StringIO()
+
+        with patch.object(install.platform, "system", return_value="Windows"), patch.object(
+            install.shutil,
+            "which",
+            return_value=r"C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe",
+        ), redirect_stdout(output):
+            result = install.check_windows_powershell()
+
+        self.assertTrue(result)
+        self.assertIn("Windows PowerShell", output.getvalue())
+
+    def test_windows_powershell_check_reports_when_executable_is_missing(self):
+        output = io.StringIO()
+
+        with patch.object(install.platform, "system", return_value="Windows"), patch.object(
+            install.shutil,
+            "which",
+            return_value=None,
+        ), redirect_stdout(output):
+            result = install.check_windows_powershell()
+
+        self.assertFalse(result)
+        self.assertIn("[缺失]", output.getvalue())
+
     def test_windows_check_reports_the_selected_activatable_registry_view(self):
         selected_registration = SimpleNamespace(
             clsid="{45540001-5750-5300-4B49-4E47534F4655}",
@@ -29,10 +55,10 @@ class InstallCheckTests(unittest.TestCase):
             "resolve_com_runtime",
             return_value=resolution,
         ), redirect_stdout(output):
-            result = install.check_wps()
+            result = install.check_windows_powershell_and_wps()
 
         self.assertTrue(result)
-        self.assertIn("32-bit view", output.getvalue())
+        self.assertIn("32-bit", output.getvalue())
         self.assertIn(selected_registration.clsid, output.getvalue())
         self.assertIn(resolution.powershell_executable, output.getvalue())
 
@@ -54,17 +80,17 @@ class InstallCheckTests(unittest.TestCase):
             "resolve_com_runtime",
             return_value=resolution,
         ), redirect_stdout(output):
-            result = install.check_wps()
+            result = install.check_windows_powershell_and_wps()
 
         self.assertFalse(result)
-        self.assertIn("COM 注册不可激活", output.getvalue())
+        self.assertIn("[缺失]", output.getvalue())
         self.assertIn("CLSID has no activation server", output.getvalue())
 
     def test_file_check_no_longer_requires_unused_config_json(self):
         output = io.StringIO()
 
         with redirect_stdout(output):
-            result = install.check_files()
+            result = install.check_resources()
 
         self.assertTrue(result)
         self.assertNotIn("config.json", output.getvalue())

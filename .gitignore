@@ -6,7 +6,6 @@
 # 私有资料 (不同步到GitHub)
 # ============================================
 WPS接口API/
-/logs/
 planplan.md
 
 
@@ -19,9 +18,7 @@ planplan.md
 # 构建产物
 # ============================================
 dist/
-**/dist/
 build/
-**/build/
 out/
 .next/
 .nuxt/
@@ -67,9 +64,6 @@ ehthumbs.db
 Desktop.ini
 $RECYCLE.BIN/
 *.lnk
-
-# Linux
-*~
 
 # ============================================
 # 环境和配置
@@ -183,7 +177,8 @@ CHANGELOG.md
 .claude
 .spec-workflow
 
-# 仅供本地分析的过程文档
-docs/
+# Agent file
+AGENTS.md
 CONTEXT.md
 understand.md
+docs/

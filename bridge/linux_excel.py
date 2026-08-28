@@ -7,7 +7,7 @@ linux_excel.py — Linux 平台 Excel 后端（基于 vendored openpyxl）
 - save / saveAs 落盘；openWorkbook 同时可用 WPS CLI 打开 GUI（可选）
 - 不支持与运行中 WPS 进程交互的 action（getSelectedText 等）返回明确错误
 
-依赖：vendor/openpyxl（纯 Python，随 skill 分发，无 pip / 无外网）
+依赖：vendor/openpyxl（纯 Python，随 Skill 分发，无外部下载）
 """
 import os
 import re

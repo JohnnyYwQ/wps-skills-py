@@ -1,183 +1,47 @@
 # WPS Skills
 
-> 此项目的任何功能、架构更新，必须在结束后同步更新相关文档。这是我们契约的一部分。
+WPS Skills 让任何能加载 Agent Skills 并执行本地 shell 的编排者，通过一个本地 Action Runtime 操作 WPS Excel、PPT 和 Word。编排者拥有 WPS 任务：先查询 Catalog，逐个执行 Action，读取每步结果后再决定下一步。
 
-WPS Skills 让智能体通过本地 Python 桥接操控 WPS Excel、PPT 和 Word。当前运行时不依赖 MCP、Node.js、外网或 pip 安装。
+## 使用方式
 
-## 运行架构
+运行环境只需要已有的 Python；Windows 实机运行还需要 Windows PowerShell 和已注册 COM 的 WPS Office。仓内已随附 Linux Excel 后端所需源码；本轮没有改动、重新设计或验收 Linux 后端。
 
-```text
-智能体 / 用户
-  → python scripts/call.py <action> ...
-  → HTTP 127.0.0.1:58891/dispatch
-  → action_manifest.json 路由到 Excel / PPT / Word 控制器
-  → Windows: 严格校验参数 → PowerShell line-RPC → WPS COM → 严格校验结果
-    Linux: 保留现有参数语义 → 进程内 openpyxl / OpenXML 文件后端
-```
-
-一次 `call.py` 只执行一个 Action。多 Action 的任务由智能体逐步编排；执行桥不创建 `task-id`。同一任务中的 Action 会复用 bridge，任务保存并验证完成后应显式停止它。
-
-## 平台
-
-| 平台 | 支持情况 | 后端 |
-|---|---|---|
-| Windows | 支持 | PowerShell 5.1 + WPS COM：`Ket.Application` / `Kwpp.Application` / `Kwps.Application` |
-| Linux | 支持文件级自动化 | vendored openpyxl（Excel）及标准库 OpenXML（PPT/Word） |
-| macOS | 不支持真实 WPS 自动化 | 没有对应控制器 |
-
-Python 需要 3.8 或更高版本。Windows 需要已安装且正确注册 COM 的 WPS Office；无需提前手动打开应用，首个目标 Action 会复用现有实例或尝试创建它。
-
-## 快速使用
-
-先检查环境：
+先做只读环境报告：
 
 ```bash
 python scripts/install.py --check
 ```
 
-直接调用 Action；`call.py` 会自动启动本地桥接服务，并且只复用当前 checkout、当前运行时代码完全匹配的实例：
+每次调用前，先从 Catalog 读取精确的 Action Contract：
 
 ```bash
-# 先读取目标 Contract，再调用
+python scripts/actions.py search chart
 python scripts/actions.py describe setCellValue --app excel
-python scripts/call.py setCellValue '{"row":1,"col":1,"value":42}'
-
-# PPT
-python scripts/call.py createPresentation '{}'
-python scripts/call.py addSlide '{"layout":"blank"}'
-
-# Word
-python scripts/call.py createDocument '{}'
-python scripts/call.py insertText '{"text":"hello"}'
+python scripts/call.py setCellValue --app excel '{"row": 1, "col": 1, "value": 42}'
 ```
 
-PowerShell 5.1 下推荐参数文件，避免 shell 改写 JSON 引号：
+PowerShell 5.1 推荐传入 JSON 文件，避免命令行转义：
 
 ```powershell
-python scripts/call.py addSlide --params-file C:\tmp\slide.json
+python scripts/call.py addSlide --app ppt --params-file C:\tmp\slide.json
 ```
 
-唯一归属的 Action 自动路由。重名 Action 必须显式指定应用：
+`call.py` 一次只执行一个 Action，并在输出响应前清理本次 Runtime 和 controller。Catalog 仅读取 Manifest，不会初始化 WPS。普通 Action 面向对应应用的活动文档；需要改变目标时，先使用显式的创建、打开、列举或切换 Action。
 
-```bash
-python scripts/call.py findReplace --app word --params-file replace.json
-python scripts/call.py insertImage --app ppt --params-file image.json
-```
+## 安全与可靠性
 
-缺少 `--app` 会返回 `AMBIGUOUS_ACTION` 和候选应用，不会猜测并操作错误的软件。
-
-## Action Contract Catalog
-
-Windows v1 Action 的名称、路由、参数 Schema、结果 Schema、前置条件和风险全部来自 `bridge/action_manifest.json`。编排者应先搜索并读取 Contract，再构造 `call.py` 参数；不要从 README 或 `SKILL.md` 猜测字段。
-
-```bash
-python scripts/actions.py list
-python scripts/actions.py list --app ppt
-python scripts/actions.py search chart
-python scripts/actions.py describe addSlide --app ppt
-python scripts/validate_action_manifest.py
-```
-
-运行中的 bridge 也提供 `GET /actions` 摘要和 `GET /actions/{owner}/{action}` 完整 Contract。查询只读取 manifest，不会初始化 WPS/COM。v1 严格契约以 Windows COM 行为为基线；Linux 后端后续对齐，不参与 v1 Schema 设计。
-
-## 服务生命周期
-
-bridge 是多 Action 任务中的临时会话服务。完成所有编辑后，先 `save`/`saveAs` 并验证产物，再停止服务：
-
-```bash
-python scripts/service.py status
-python scripts/service.py stop
-```
-
-需要让运行中的当前 checkout 加载代码改动时使用：
-
-```bash
-python scripts/service.py restart
-```
-
-- `call.py` 会校验 checkout 路径、代码指纹和随机实例 ID，不会再把另一目录、旧代码或旧版 `{"status":"ok"}` 服务误认为当前服务。
-- `/dispatch` 和 `/shutdown` 都要求实例身份请求头，避免健康检查后实例被替换时把命令发错进程；普通调用统一走 `call.py`。
-- 健康检查超时会报告 `BRIDGE_UNAVAILABLE`，不会被误判为“未启动”并拉起第二实例；bridge 会并发处理 `/health`，因此持续超时表示 handler 已饱和、进程卡住或本机网络链路异常，需要结合监听 PID 和 trace 排查。
-- `/health` 的 `state` 区分 `idle`、`running` 和 `stopping`；运行中还会返回 `activeAction.traceId`、Action 名称和开始时间，不包含 Action 参数。
-- 正常停止会关闭 Excel/PPT/Word 控制器，并让持久 PowerShell 先处理 `EXIT`；只有超时才 terminate/kill。
-- 如果智能体异常中断而没执行 `stop`，bridge 会在最后一个 Action 完成后空闲 15 分钟自动退出。可在启动前用 `WPS_BRIDGE_IDLE_SECONDS` 调整，设为 `0` 表示禁用兜底回收。
-- 旧版或另一 checkout 的服务不会被自动强杀，因为它可能持有未保存文档。应先确认并保存对应 WPS 状态，再人工处理；新版外部 checkout 只有显式 `--takeover` 才允许协作式关闭。
-
-首次升级若 `python scripts/service.py status` 返回 `legacy`，命令输出会给出 Windows/macOS/Linux 的监听 PID 定位方式。先核对进程路径并保存它持有的文档，再人工终止旧进程；新版 bridge 此后即可由 `service.py stop/restart` 正常管理。
-
-精确 Action Contract 通过 `scripts/actions.py` 或 `bridge/action_manifest.json` 查询；[SKILL.md](SKILL.md) 只维护调用工作流和风险边界，整条执行链说明见 [understand.md](understand.md)。
-
-## Action trace
-
-每个 Action 默认创建一个结构化 JSONL trace。成功和失败响应都返回：
-
-```json
-{
-  "success": false,
-  "error": "…",
-  "traceId": "act-20260826-…",
-  "traceLog": "C:\\...\\wps-skills\\logs\\traces\\2026-08-26\\act-20260826-….jsonl"
-}
-```
-
-默认日志位置：
-
-```text
-logs/traces/YYYY-MM-DD/<traceId>.jsonl
-logs/server-YYYY-MM-DD.log
-```
-
-- `traceId` 贯穿 `call.py → HTTP → 路由 → 控制器 → PowerShell/COM`。
-- 当前 trace 级别以 `bridge/action_trace.py` 顶部的 `TRACE_LEVEL` 实际值为准；常规建议设为 `"info"`，排障时手动改成 `"debug"`，LLM 的调用命令无需变化。
-- 显式设置的 `WPS_TRACE=info|debug` 优先于代码开关，可用于临时覆盖。`call.py` 的下一次调用会加载新值；已经运行的桥接服务用 `python scripts/service.py restart` 加载代码开关的新值。
-- `WPS_TRACE_DIR` 可覆盖日志根目录；skill 目录不可写时，Windows 降级到 `%LOCALAPPDATA%\wps-skills\logs`。
-- 所有候选目录都不可写时，Action 仍执行，响应以 `traceLog:null`/`traceWarning` 明确降级。
-- trace 和 server 日志只保留 24 小时，自动清理不会触碰其他项目文件。
-
-## 路由和可靠性
-
-- HTTP handler 最多 16 个并发线程，因此慢连接或长 Action 不会独占 `/health`；达到上限的新连接会被关闭，不会无限创建线程。
-- 合法 Action 在读取、校验和路由后通过全局执行门严格串行进入 controller；并发 `/dispatch` 不会交错 PowerShell 单行协议。
-- 每个连接有 10 秒 I/O 超时，请求体最大 16 MiB，避免半包请求让 idle/stop 永久失效。
-- shutdown 开始后不再接纳 Action；已经执行的 Action 会完成，排队中的 Action 返回 `503 BRIDGE_SHUTTING_DOWN`，controller 在所有 handler 退出后只清理一次。
-- 每次 PowerShell 尝试使用独立 `reqId`；同一 Action 的自动重试保持相同 `traceId`。
-- stderr 会被持续排空并写入对应 Action trace，避免管道阻塞。
-- 单 Action 超过 60 秒会终止桥接进程；可恢复 COM 故障会自动重连并重试一次。
-- `saveAs` 等通用 Action 建议显式指定应用；缺失时可以按目标文件扩展名推断。
+- 多 Action 的 WPS 任务由编排者串行提交，并等待每一步 JSON 响应；系统 mutex 只防止不同进程误并发。
+- 先检查 Contract 的 `risk`：只有 `read` Action 在可识别的短暂 COM/RPC 故障后自动重试一次。`write` 或 `destructive` 的不确定结果带 `outcomeUnknown:true`，应先用只读 Action 核验活动文档。
+- `saveAs`、`convertToPDF` 和 `convertFormat` 在目标已存在时默认拒绝；只有明确的 `overwrite:true` 才允许覆盖。
+- 每个响应都有 `traceId` 和 `traceLog`。排障时从该 trace 的末尾向前查看；不要重复提交不确定的写入 Action。
 
 ## 验证
 
-不需要 Windows 或 WPS 的单元测试：
+无需 Windows 或 WPS 实机即可验证本规格范围：
 
 ```bash
-PYTHONPATH=bridge python -m unittest \
-  bridge/test_action_trace.py \
-  bridge/test_action_manifest.py \
-  bridge/test_action_catalog.py \
-  bridge/test_windows_com.py \
-  bridge/test_install_check.py \
-  bridge/test_server_routing.py \
-  bridge/test_controller_trace.py \
-  bridge/test_service_lifecycle.py \
-  bridge/test_server_lifecycle.py \
-  bridge/test_service_cli.py
+python scripts/validate_action_manifest.py
+python -m unittest discover -s bridge -p 'test_*.py'
 ```
 
-实机连通和功能检查：
-
-```bash
-python scripts/test.py
-python scripts/test_functional.py
-```
-
-## 重要文档
-
-- [SKILL.md](SKILL.md)：智能体调用工作流、边界与高风险注意事项
-- [understand.md](understand.md)：端到端执行链、任务边界和排障说明
-- [CONTEXT.md](CONTEXT.md)：项目统一术语
-- [docs/adr/0001-explicit-app-for-ambiguous-actions.md](docs/adr/0001-explicit-app-for-ambiguous-actions.md)：重名 Action 路由决策
-- [docs/adr/0002-action-level-tracing-boundary.md](docs/adr/0002-action-level-tracing-boundary.md)：Action trace 边界决策
-
-## 许可证
-
-MIT
+自动化套件覆盖 Catalog、Manifest、Action CLI、Runtime、mutex、风险策略、三个控制器的静态 Contract、trace 与子进程清理。Windows/WPS 实机验证仍是运行环境验收，非本轮交付前提。
