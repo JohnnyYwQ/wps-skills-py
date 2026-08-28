@@ -21,7 +21,7 @@ function Invoke-WpsAction {
     )
 
     $requestJson = $Params | ConvertTo-Json -Depth 20 -Compress
-    $rawResponse = $requestJson | & $PythonExe $callScript $Action --app $App --stdin
+    $rawResponse = $requestJson | & $PythonExe -X utf8 $callScript $Action --app $App --stdin
     $exitCode = $LASTEXITCODE
     $responseText = ($rawResponse | Out-String).Trim()
 

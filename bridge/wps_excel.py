@@ -534,7 +534,7 @@ function Exec-createChart($p) {
     $chartObj.Chart.ChartType = $chartType
     if ($p.title) { $chartObj.Chart.HasTitle = $true; $chartObj.Chart.ChartTitle.Text = $p.title }
     if ($p.showLegend -ne $false) { $chartObj.Chart.HasLegend = $true }
-    if ($p.showDataLabels) { $chartObj.Chart.HasAxis = $true }
+    if ($p.showDataLabels) { [void]$chartObj.Chart.ApplyDataLabels() }
     $chartTypeName = if ($p.chartTypeName) { $p.chartTypeName } else { [string]$p.chartType }
     return @{success=$true; data=@{chartName=$chartObj.Name; chartIndex=1; dataRange=$p.dataRange; chartType=$chartTypeName; position=@{left=$left; top=$top; width=$width; height=$height}}}
 }
@@ -558,7 +558,7 @@ function Exec-exportChartAsImage($p) {
     $chartObj = $sheet.ChartObjects($p.chartName)
     $outputPath = $p.outputPath
     $format = if ($p.format) { $p.format } else { "PNG" }
-    $chartObj.Chart.Export($outputPath, $format)
+    [void]$chartObj.Chart.Export($outputPath, $format)
     return @{success=$true; data=@{chartName=$p.chartName; outputPath=$outputPath; format=$format}}
 }
 
@@ -568,12 +568,12 @@ function Exec-exportRangeAsImage($p) {
     $range = $sheet.Range($p.range)
     $outputPath = $p.outputPath
     $format = if ($p.format) { $p.format } else { "PNG" }
-    $range.CopyPicture(1, 2)
+    [void]$range.CopyPicture(1, 2)
     $tempChart = $sheet.ChartObjects().Add(0, 0, $range.Width, $range.Height)
-    $tempChart.Activate()
-    $tempChart.Chart.Paste()
-    $tempChart.Chart.Export($outputPath, $format)
-    $tempChart.Delete()
+    [void]$tempChart.Activate()
+    [void]$tempChart.Chart.Paste()
+    [void]$tempChart.Chart.Export($outputPath, $format)
+    [void]$tempChart.Delete()
     return @{success=$true; data=@{range=$p.range; outputPath=$outputPath; format=$format}}
 }
 
@@ -980,7 +980,7 @@ function Invoke-ExcelSafeTargetWrite($targetPath, $overwrite, [scriptblock]$writ
             $keepBackup = $false
             return @{success=$false; code="TARGET_WRITE_FAILED"; error="目标写入失败，已恢复原文件: $writeError"}
         } catch {
-            return @{success=$false; code="OVERWRITE_RESTORE_FAILED"; error="目标写入失败且无法恢复；备份保留在 $backupPath: $writeError"}
+            return @{success=$false; code="OVERWRITE_RESTORE_FAILED"; error="目标写入失败且无法恢复；备份保留在 ${backupPath}: $writeError"}
         }
     } finally {
         if (-not $keepBackup) {

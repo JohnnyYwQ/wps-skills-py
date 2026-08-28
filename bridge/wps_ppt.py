@@ -1133,7 +1133,7 @@ function Invoke-PptSafeTargetWrite($targetPath, $overwrite, [scriptblock]$write)
             $keepBackup = $false
             return @{success=$false; code="TARGET_WRITE_FAILED"; error="目标写入失败，已恢复原文件: $writeError"}
         } catch {
-            return @{success=$false; code="OVERWRITE_RESTORE_FAILED"; error="目标写入失败且无法恢复；备份保留在 $backupPath: $writeError"}
+            return @{success=$false; code="OVERWRITE_RESTORE_FAILED"; error="目标写入失败且无法恢复；备份保留在 ${backupPath}: $writeError"}
         }
     } finally {
         if (-not $keepBackup) {
