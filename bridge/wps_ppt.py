@@ -24,6 +24,7 @@ import queue
 import threading
 from typing import Any, Dict, Optional
 
+from action_catalog import ActionCatalog, INTERNAL_WINDOWS_HANDLERS
 from powershell_contracts import render_chart_type_converter
 from line_process import stop_line_process
 from action_timing import bounded_timeout
@@ -38,7 +39,16 @@ IS_MACOS = platform.system() == "Darwin"
 PPT_PROGID = "Kwpp.Application"
 
 # 单个 action 执行超时（秒）
-EXEC_TIMEOUT = 60
+EXEC_TIMEOUT = 120
+
+_PPT_CATALOG = ActionCatalog.from_path()
+
+
+def _requires_active_presentation(action: str) -> bool:
+    """Read the PPT document prerequisite from its Action Contract."""
+    if action in INTERNAL_WINDOWS_HANDLERS["ppt"]:
+        return False
+    return "active_presentation" in _PPT_CATALOG.get("ppt", action)["prerequisites"]
 
 # PowerShell 桥接脚本（持久进程模式）
 PS_BRIDGE_SCRIPT = r'''
@@ -123,7 +133,10 @@ function Convert-ZOrder($value) {
     return [int]$value
 }
 
-function Get-ActivePres { if ($global:ppt.ActivePresentation) { return $global:ppt.ActivePresentation }; return $null }
+function Get-PptActivePresentation {
+    try { return $global:ppt.ActivePresentation } catch { return $null }
+}
+function Get-ActivePres { return Get-PptActivePresentation }
 function Get-PresByName($name) {
     foreach ($p in $global:ppt.Presentations) { if ($p.Name -eq $name) { return $p } }
     return $null
@@ -169,7 +182,7 @@ function Exec-openPresentation($p) {
 }
 
 function Exec-closePresentation($p) {
-    $pres = if ($p.name) { Get-PresByName $p.name } else { Get-ActivePres }
+    $pres = Get-ActivePres
     if (-not $pres) { return @{success=$false; error="未找到演示文稿"} }
     if ($p.save -eq $true) { try { $pres.Save() } catch {} }
     $pres.Close()
@@ -1083,36 +1096,74 @@ function Exec-save($p) {
     if (-not $pres) { return @{success=$false; error="无活动演示文稿"} }
     try { $pres.Save(); return @{success=$true} } catch { return @{success=$false; error=$_.Exception.Message} }
 }
+function Invoke-PptSafeTargetWrite($targetPath, $overwrite, [scriptblock]$write) {
+    if (-not (Test-Path -LiteralPath $targetPath)) {
+        try {
+            & $write
+            return @{success=$true}
+        } catch {
+            return @{success=$false; code="TARGET_WRITE_FAILED"; error=$_.Exception.Message}
+        }
+    }
+    if (-not $overwrite) {
+        return @{success=$false; code="TARGET_EXISTS"; error="目标文件已存在: $targetPath"}
+    }
+
+    try {
+        $fullPath = [System.IO.Path]::GetFullPath($targetPath)
+        $directory = [System.IO.Path]::GetDirectoryName($fullPath)
+        $backupPath = [System.IO.Path]::Combine(
+            $directory,
+            "." + [System.IO.Path]::GetFileName($fullPath) + "." + [Guid]::NewGuid() + ".wps-backup"
+        )
+        [System.IO.File]::Copy($fullPath, $backupPath, $false)
+    } catch {
+        return @{success=$false; code="OVERWRITE_NOT_SAFE"; error="无法安全备份现有目标: $($_.Exception.Message)"}
+    }
+
+    $keepBackup = $true
+    try {
+        & $write
+        $keepBackup = $false
+        return @{success=$true}
+    } catch {
+        $writeError = $_.Exception.Message
+        try {
+            [System.IO.File]::Copy($backupPath, $fullPath, $true)
+            $keepBackup = $false
+            return @{success=$false; code="TARGET_WRITE_FAILED"; error="目标写入失败，已恢复原文件: $writeError"}
+        } catch {
+            return @{success=$false; code="OVERWRITE_RESTORE_FAILED"; error="目标写入失败且无法恢复；备份保留在 $backupPath: $writeError"}
+        }
+    } finally {
+        if (-not $keepBackup) {
+            try { [System.IO.File]::Delete($backupPath) } catch {}
+        }
+    }
+}
 function Exec-saveAs($p) {
     $pres = Get-ActivePres
     if (-not $pres) { return @{success=$false; error="无活动演示文稿"} }
-    try {
-        # DisplayAlerts=0 已在初始化时设置，可抑制“是否覆盖”对话框；
-        # 仍保险起见：保存前先删除已存在的同名文件，彻底避免 OLE_E_PROMPTSAVECANCELLED
-        if (Test-Path $p.filePath) { Remove-Item $p.filePath -Force -ErrorAction SilentlyContinue }
-        $pres.SaveAs($p.filePath)
-        $sz = 0
-        if (Test-Path $p.filePath) { $sz = (Get-Item $p.filePath).Length }
-        return @{success=$true; data=@{path=$p.filePath; size=$sz}}
-    } catch { return @{success=$false; error=$_.Exception.Message} }
+    $writeResult = Invoke-PptSafeTargetWrite $p.filePath $p.overwrite { $pres.SaveAs($p.filePath) }
+    if (-not $writeResult.success) { return $writeResult }
+    $sz = (Get-Item -LiteralPath $p.filePath).Length
+    return @{success=$true; data=@{path=$p.filePath; size=$sz}}
 }
 function Exec-convertToPDF($p) {
     $pres = Get-ActivePres
     if (-not $pres) { return @{success=$false; error="无活动演示文稿"} }
     $out = if ($p.outputPath) { $p.outputPath } else { $pres.Path + '\' + $pres.Name + '.pdf' }
-    try {
-        if (Test-Path $out) { Remove-Item $out -Force -ErrorAction SilentlyContinue }
-        $pres.SaveAs($out, 32); return @{success=$true; data=@{path=$out}}
-    } catch { return @{success=$false; error=$_.Exception.Message} }
+    $writeResult = Invoke-PptSafeTargetWrite $out $p.overwrite { $pres.SaveAs($out, 32) }
+    if (-not $writeResult.success) { return $writeResult }
+    return @{success=$true; data=@{path=$out}}
 }
 function Exec-convertFormat($p) {
     $pres = Get-ActivePres
     if (-not $pres) { return @{success=$false; error="无活动演示文稿"} }
     $out = if ($p.outputPath) { $p.outputPath } else { $pres.Path + '\' + $pres.Name + '.' + $p.targetFormat }
-    try {
-        if (Test-Path $out) { Remove-Item $out -Force -ErrorAction SilentlyContinue }
-        $pres.SaveAs($out); return @{success=$true; data=@{path=$out}}
-    } catch { return @{success=$false; error=$_.Exception.Message} }
+    $writeResult = Invoke-PptSafeTargetWrite $out $p.overwrite { $pres.SaveAs($out) }
+    if (-not $writeResult.success) { return $writeResult }
+    return @{success=$true; data=@{path=$out}}
 }
 function Exec-reconnect($p) {
     try { $global:ppt = $null; $global:ppt = Get-PptApp } catch {}
@@ -1147,7 +1198,15 @@ while ($true) {
         $attempt = $cmd.attempt
         $traceId = $cmd.traceId
 
-        $result = & "Exec-$action" $params
+        if ($cmd.requiresActivePresentation -and -not (Get-PptActivePresentation)) {
+            $result = @{
+                success=$false
+                code="NO_ACTIVE_DOCUMENT"
+                error="没有活动演示文稿；请先创建或打开演示文稿"
+            }
+        } else {
+            $result = & "Exec-$action" $params
+        }
         $sw.Stop()
         if ($null -eq $result) { $result = @{success=$true; data=$null} }
         if ($result -isnot [hashtable]) { $result = @{success=$true; data=$result} }
@@ -1400,6 +1459,7 @@ class WpsPptController:
             "attempt": attempt,
             "action": action,
             "params": params,
+            "requiresActivePresentation": _requires_active_presentation(action),
         }, ensure_ascii=True)
         self._drain_stderr(trace, attempt)
         started = time.perf_counter()

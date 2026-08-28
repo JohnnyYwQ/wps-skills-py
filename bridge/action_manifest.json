@@ -4566,9 +4566,6 @@
       "parameters": {
         "type": "object",
         "properties": {
-          "name": {
-            "type": "string"
-          },
           "save": {
             "type": "boolean"
           }
@@ -4603,6 +4600,9 @@
           "outputPath": {
             "type": "string"
           },
+          "overwrite": {
+            "type": "boolean"
+          },
           "targetFormat": {
             "type": "string"
           }
@@ -4627,7 +4627,7 @@
       "prerequisites": [
         "active_presentation"
       ],
-      "risk": "write"
+      "risk": "destructive"
     },
     {
       "owner": "ppt",
@@ -4638,6 +4638,9 @@
         "properties": {
           "outputPath": {
             "type": "string"
+          },
+          "overwrite": {
+            "type": "boolean"
           }
         },
         "required": [],
@@ -4658,7 +4661,7 @@
       "prerequisites": [
         "active_presentation"
       ],
-      "risk": "write"
+      "risk": "destructive"
     },
     {
       "owner": "ppt",
@@ -6634,6 +6637,9 @@
         "properties": {
           "filePath": {
             "type": "string"
+          },
+          "overwrite": {
+            "type": "boolean"
           }
         },
         "required": [
@@ -6660,7 +6666,7 @@
       "prerequisites": [
         "active_presentation"
       ],
-      "risk": "write"
+      "risk": "destructive"
     },
     {
       "owner": "ppt",

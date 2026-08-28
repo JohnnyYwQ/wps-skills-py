@@ -102,6 +102,51 @@ class ControllerTraceTests(unittest.TestCase):
             command["requiresActiveWorkbook"] for command in commands
         ])
 
+    def test_ppt_fake_process_receives_attach_first_startup_script(self):
+        resolution = _windows_com_resolution(
+            r"C:\\Windows\\System32\\powershell.exe",
+        )
+        process = _ready_powershell_process(_InputCapture())
+
+        with patch.object(wps_ppt, "IS_WINDOWS", True), patch.object(
+            wps_ppt, "IS_LINUX", False,
+        ), patch.object(
+            wps_ppt, "resolve_com_runtime", return_value=resolution,
+        ), patch.object(wps_ppt.subprocess, "Popen", return_value=process) as popen:
+            controller = wps_ppt.WpsPptController()
+            try:
+                script = Path(popen.call_args.args[0][-1]).read_text(encoding="utf-8-sig")
+            finally:
+                controller.close()
+
+        self.assertLess(
+            script.index("GetActiveObject('Kwpp.Application')"),
+            script.index("New-Object -ComObject 'Kwpp.Application'"),
+        )
+        self.assertNotIn("Presentations.Add", script[:script.index("function Exec-ping")])
+        self.assertIn("EXIT\n", process.stdin.lines)
+
+    def test_ppt_command_derives_active_presentation_requirement_from_contract(self):
+        controller = object.__new__(wps_ppt.WpsPptController)
+        controller._ps_process = _RunningProcess()
+        controller._ready = True
+        controller._id_counter = 0
+        controller._id_lock = threading.Lock()
+        controller._stop = None
+        controller._read_result = Mock(return_value={"success": True})
+
+        controller._exec_windows("addSlide", {})
+        controller._exec_windows("createPresentation", {})
+
+        commands = [
+            json.loads(line)
+            for line in controller._ps_process.stdin.lines
+            if line.strip()
+        ]
+        self.assertEqual([True, False], [
+            command["requiresActivePresentation"] for command in commands
+        ])
+
     def test_windows_controllers_launch_the_resolved_powershell_executable(self):
         cases = (
             (wps_excel, wps_excel.WpsExcelController),

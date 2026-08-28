@@ -304,6 +304,70 @@ class ActionManifestValidationTests(unittest.TestCase):
         self.assertIn("[System.IO.File]::Copy($backupPath, $fullPath, $true)", script)
         self.assertEqual(120, wps_excel.EXEC_TIMEOUT)
 
+    def test_ppt_contracts_preserve_active_presentation_and_targets(self):
+        catalog = ActionCatalog.from_path()
+        script = wps_ppt.PS_BRIDGE_SCRIPT
+
+        for action, path_field in (
+            ("saveAs", "filePath"),
+            ("convertToPDF", "outputPath"),
+            ("convertFormat", "outputPath"),
+        ):
+            with self.subTest(action=action):
+                contract = catalog.get("ppt", action)
+                self.assertEqual("destructive", contract["risk"])
+                self.assertEqual(
+                    "boolean", contract["parameters"]["properties"]["overwrite"]["type"],
+                )
+                params = {"targetFormat": "pptx"} if action == "convertFormat" else {}
+                if action == "saveAs":
+                    params[path_field] = r"C:\\tmp\\report.pptx"
+                catalog.validate_params("ppt", action, {**params, "overwrite": True})
+                with self.assertRaises(ActionValidationError):
+                    catalog.validate_params("ppt", action, {**params, "overwrite": "yes"})
+
+        self.assertLess(
+            script.index("GetActiveObject('Kwpp.Application')"),
+            script.index("New-Object -ComObject 'Kwpp.Application'"),
+        )
+        startup = script[:script.index("function Exec-ping")]
+        self.assertNotIn("Presentations.Add", startup)
+        self.assertIn("NO_ACTIVE_DOCUMENT", script)
+        self.assertNotIn("PptActionsWithoutActivePresentation", script)
+        self.assertRegex(
+            script,
+            r'if \(\$cmd\.requiresActivePresentation -and -not \(Get-PptActivePresentation\)\) \{\s*\$result = @\{\s*success=\$false\s*code="NO_ACTIVE_DOCUMENT"',
+        )
+        self.assertRegex(
+            script,
+            re.compile(r"function Exec-createPresentation\(\$p\).*Presentations\.Add", re.DOTALL),
+        )
+        self.assertRegex(
+            script,
+            re.compile(r"function Exec-openPresentation\(\$p\).*Presentations\.Open", re.DOTALL),
+        )
+        self.assertNotRegex(script, r"\.Quit\s*\(")
+        self.assertNotIn("Remove-Item", script)
+        self.assertIn("function Invoke-PptSafeTargetWrite", script)
+        self.assertEqual(4, script.count("Invoke-PptSafeTargetWrite"))
+        self.assertIn("TARGET_EXISTS", script)
+        self.assertIn("OVERWRITE_NOT_SAFE", script)
+        self.assertIn("OVERWRITE_RESTORE_FAILED", script)
+        self.assertIn("[System.IO.File]::Copy($backupPath, $fullPath, $true)", script)
+        self.assertEqual(120, wps_ppt.EXEC_TIMEOUT)
+
+        close_contract = catalog.get("ppt", "closePresentation")
+        self.assertNotIn("name", close_contract["parameters"]["properties"])
+        with self.assertRaises(ActionValidationError):
+            catalog.validate_params("ppt", "closePresentation", {"name": "other.pptx"})
+        self.assertRegex(
+            script,
+            re.compile(
+                r"function Exec-closePresentation\(\$p\)\s*\{\s*\$pres = Get-ActivePres",
+                re.DOTALL,
+            ),
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
