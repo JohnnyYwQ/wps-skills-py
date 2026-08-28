@@ -1,6 +1,7 @@
 import subprocess
 import sys
 from pathlib import Path
+import tempfile
 import unittest
 
 
@@ -60,6 +61,28 @@ class ZeroInstallDeliveryTests(unittest.TestCase):
                         f"{relative_path} must be ASCII because Windows PowerShell 5.1 "
                         f"treats UTF-8 without BOM as the system ANSI code page: {exc}"
                     )
+
+    def test_powershell_bridge_exporter_writes_bom_encoded_scripts(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    "scripts/export_windows_powershell_bridges.py",
+                    "--output-dir",
+                    tmp,
+                ],
+                cwd=ROOT,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+
+            self.assertEqual(0, result.returncode, result.stderr)
+            for app in ("excel", "ppt", "word"):
+                path = Path(tmp) / f"wps_{app}.ps1"
+                content = path.read_bytes()
+                self.assertTrue(content.startswith(b"\xef\xbb\xbf"), path)
+                self.assertIn(b"function Exec-ping", content)
 
 
 if __name__ == "__main__":

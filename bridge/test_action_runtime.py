@@ -105,7 +105,10 @@ class ActionRuntimeTests(unittest.TestCase):
             {"WPS_TRACE_DIR": tmp, "WPS_TRACE": "info"},
             clear=False,
         ):
-            runtime = ActionRuntime(controller_factory=controller_factory)
+            runtime = ActionRuntime(
+                controller_factory=controller_factory,
+                action_gate_factory=lambda: None,
+            )
             try:
                 response = runtime.execute(ActionRequest(
                     action="setCellValue",

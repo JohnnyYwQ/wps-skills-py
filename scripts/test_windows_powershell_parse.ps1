@@ -3,7 +3,6 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
-$repoRoot = Split-Path -Parent $PSScriptRoot
 $tempRoot = [System.IO.Path]::Combine(
     [System.IO.Path]::GetTempPath(),
     "wps-bridge-parse-$([Guid]::NewGuid().ToString('N'))"
@@ -18,37 +17,11 @@ function Invoke-Python {
     }
 }
 
-$previousRepoRoot = $env:WPS_BRIDGE_REPO_ROOT
-$previousOutputRoot = $env:WPS_BRIDGE_PARSE_ROOT
-
 try {
     [System.IO.Directory]::CreateDirectory($tempRoot) | Out-Null
-    $env:WPS_BRIDGE_REPO_ROOT = $repoRoot
-    $env:WPS_BRIDGE_PARSE_ROOT = $tempRoot
-
     Invoke-Python -Arguments @("--version")
-
-    $exportCode = @'
-import os
-import sys
-from pathlib import Path
-
-repo_root = Path(os.environ["WPS_BRIDGE_REPO_ROOT"])
-output_root = Path(os.environ["WPS_BRIDGE_PARSE_ROOT"])
-sys.path.insert(0, str(repo_root / "bridge"))
-
-import wps_excel
-import wps_ppt
-import wps_word
-
-for name, script in (
-    ("excel", wps_excel.PS_BRIDGE_SCRIPT),
-    ("ppt", wps_ppt.PS_BRIDGE_SCRIPT),
-    ("word", wps_word.PS_BRIDGE_SCRIPT),
-):
-    (output_root / f"wps_{name}.ps1").write_text(script, encoding="utf-8-sig")
-'@
-    Invoke-Python -Arguments @("-c", $exportCode)
+    $exportScript = Join-Path $PSScriptRoot "export_windows_powershell_bridges.py"
+    Invoke-Python -Arguments @($exportScript, "--output-dir", $tempRoot)
 
     $failed = $false
     foreach ($app in @("excel", "ppt", "word")) {
@@ -79,8 +52,6 @@ for name, script in (
         throw "PowerShell bridge parse regression test failed"
     }
 } finally {
-    $env:WPS_BRIDGE_REPO_ROOT = $previousRepoRoot
-    $env:WPS_BRIDGE_PARSE_ROOT = $previousOutputRoot
     if (
         [System.IO.Directory]::Exists($tempRoot) -and
         [System.IO.Path]::GetFileName($tempRoot).StartsWith("wps-bridge-parse-")

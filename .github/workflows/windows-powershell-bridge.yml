@@ -7,6 +7,7 @@ on:
       - "bridge/wps_ppt.py"
       - "bridge/wps_word.py"
       - "bridge/powershell_contracts.py"
+      - "scripts/export_windows_powershell_bridges.py"
       - "scripts/test_windows_powershell_parse.ps1"
       - ".github/workflows/windows-powershell-bridge.yml"
   pull_request:
@@ -15,6 +16,7 @@ on:
       - "bridge/wps_ppt.py"
       - "bridge/wps_word.py"
       - "bridge/powershell_contracts.py"
+      - "scripts/export_windows_powershell_bridges.py"
       - "scripts/test_windows_powershell_parse.ps1"
       - ".github/workflows/windows-powershell-bridge.yml"
   workflow_dispatch:
