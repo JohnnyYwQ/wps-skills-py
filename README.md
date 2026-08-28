@@ -40,8 +40,23 @@ python scripts/call.py addSlide --app ppt --params-file C:\tmp\slide.json
 无需 Windows 或 WPS 实机即可验证本规格范围：
 
 ```bash
-python scripts/validate_action_manifest.py
-python -m unittest discover -s bridge -p 'test_*.py'
+python scripts/test_ci.py
 ```
 
 自动化套件覆盖 Catalog、Manifest、Action CLI、Runtime、mutex、风险策略、三个控制器的静态 Contract、trace 与子进程清理。Windows/WPS 实机验证仍是运行环境验收，非本轮交付前提。
+
+Windows PowerShell bridge 的纯语法回归测试可在不安装 WPS 的 Windows 或
+GitHub Actions `windows-latest` runner 上运行：
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\test_windows_powershell_parse.ps1
+```
+
+在安装了 WPS Office 的 Windows 实机上，可运行完整 bridge 回归测试。脚本会创建并
+关闭一个不保存的测试工作簿；测试期间不要手动切换 WPS 的活动文档：
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\test_windows_wps_regressions.ps1
+```
+
+如需保留导出的 PNG 供人工检查，附加 `-KeepArtifacts`。
