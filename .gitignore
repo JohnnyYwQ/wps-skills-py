@@ -1,0 +1,187 @@
+# ============================================
+# WPS-Claude-Skills Git 忽略配置
+# ============================================
+
+# ============================================
+# 私有资料 (不同步到GitHub)
+# ============================================
+WPS接口API/
+planplan.md
+
+
+# 包管理器锁文件 (可选保留)
+# package-lock.json
+# yarn.lock
+# pnpm-lock.yaml
+
+# ============================================
+# 构建产物
+# ============================================
+dist/
+build/
+out/
+.next/
+.nuxt/
+
+# ============================================
+# IDE 和编辑器
+# ============================================
+# VSCode
+.vscode/
+!.vscode/settings.json
+!.vscode/tasks.json
+!.vscode/launch.json
+!.vscode/extensions.json
+
+# JetBrains IDEs
+.idea/
+*.iml
+*.iws
+
+# Sublime Text
+*.sublime-workspace
+*.sublime-project
+
+# Vim
+*.swp
+*.swo
+*~
+
+# ============================================
+# 操作系统文件
+# ============================================
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+.Spotlight-V100
+.Trashes
+
+# Windows
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+*.lnk
+
+# ============================================
+# 环境和配置
+# ============================================
+# 环境变量文件
+.env
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
+*.env
+
+# 本地配置
+local.config.js
+local.config.ts
+*.local.json
+*.local.yaml
+*.local.yml
+
+# ============================================
+# 日志和临时文件
+# ============================================
+logs/
+logs-old/
+*.log
+tmp/
+temp/
+.tmp/
+.temp/
+.cache/
+
+# ============================================
+# 测试覆盖率
+# ============================================
+coverage/
+.nyc_output/
+*.lcov
+.coverage
+test-results/
+
+# ============================================
+# WPS 相关
+# ============================================
+# WPS 加载项运行时文件
+wps-claude-addon/logs/
+wps-claude-addon/.cache/
+
+# WPS 临时文件
+*.wps
+*.et
+*.dps
+~$*.doc*
+~$*.xls*
+~$*.ppt*
+
+# ============================================
+# 示例和测试文件 (可选)
+# ============================================
+# 保留示例文件，但忽略用户生成的测试文件
+# examples/user-*
+# examples/*.tmp.*
+
+# ============================================
+# 敏感信息
+# ============================================
+# API 密钥和凭证
+*.key
+*.pem
+*.p12
+*.pfx
+credentials.json
+secrets.json
+api-keys.json
+
+# Claude 配置 (如果包含敏感信息)
+# .claude/
+
+# ============================================
+# 其他
+# ============================================
+# 压缩文件
+*.zip
+*.tar.gz
+*.rar
+*.7z
+
+# 调试文件
+.debug/
+*.dump
+
+# 性能分析
+*.cpuprofile
+*.heapsnapshot
+
+# 文档生成
+docs-generated/
+api-docs/
+
+# Jupyter Notebooks
+.ipynb_checkpoints/
+
+# Python (如果有 Python 脚本)
+__pycache__/
+*.py[cod]
+*$py.class
+venv/
+.venv/
+
+# 其他 Claude 相关文件
+CLAUDE.md
+CHANGELOG.md
+.claude
+.spec-workflow
+
+# Agent file
+AGENTS.md
+CONTEXT.md
+understand.md
+docs/
+fix.md
+
