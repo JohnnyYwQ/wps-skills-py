@@ -95,8 +95,8 @@ def trace(number):
     return TraceContext(trace_id=f"trace-{number}", trace_log=None)
 
 
-def content_range(start=0, end=0):
-    return {"start": start, "end": end, "revision": "revision-1"}
+def content_range(start=0, end=0, revision="revision-1"):
+    return {"start": start, "end": end, "revision": revision}
 
 
 def point(value):
@@ -337,12 +337,12 @@ class WindowsWriterBackendTests(unittest.TestCase):
             "insert_structured_body_content": {
                 "revisionBefore": "revision-1",
                 "revisionAfter": "revision-2",
-                "range": content_range(0, 6) | {"revision": "revision-2"},
+                "range": content_range(0, 6, revision="revision-2"),
             },
             "read_revision_coherent_snapshot": {
                 "revision": "revision-2",
-                "scopeRange": content_range(0, 6) | {"revision": "revision-2"},
-                "returnedRange": content_range(0, 6) | {"revision": "revision-2"},
+                "scopeRange": content_range(0, 6, revision="revision-2"),
+                "returnedRange": content_range(0, 6, revision="revision-2"),
                 "text": "Hello\n",
                 "paragraphs": (),
                 "structure": EMPTY_STRUCTURE,

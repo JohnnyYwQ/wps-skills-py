@@ -1,6 +1,6 @@
 import io
 import json
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
 import threading
 import unittest
 
@@ -400,29 +400,34 @@ class SessionHostTests(unittest.TestCase):
         self.assertEqual(1, session.close_count)
 
     def test_trace_log_path_is_serialized_as_a_wire_string(self):
-        session = FakeActionSession()
-        output = io.StringIO()
-        host = SessionHost(
-            session_factory=lambda **kwargs: session,
-            session_id_factory=lambda: "session-1",
-            pid_factory=lambda: 123,
-            trace_log_factory=lambda **kwargs: Path("logs/session-1.jsonl"),
+        paths = (
+            (PurePosixPath("logs/session-1.jsonl"), "logs/session-1.jsonl"),
+            (PureWindowsPath("logs/session-1.jsonl"), r"logs\session-1.jsonl"),
         )
+        for trace_path, expected in paths:
+            with self.subTest(path_type=type(trace_path).__name__):
+                session = FakeActionSession()
+                output = io.StringIO()
+                host = SessionHost(
+                    session_factory=lambda **kwargs: session,
+                    session_id_factory=lambda: "session-1",
+                    pid_factory=lambda: 123,
+                    trace_log_factory=lambda **kwargs: trace_path,
+                )
 
-        exit_code = host.serve(
-            application="word",
-            input_stream=io.StringIO('{"control":"close"}\n'),
-            output_stream=output,
-            error_stream=io.StringIO(),
-        )
+                exit_code = host.serve(
+                    application="word",
+                    input_stream=io.StringIO('{"control":"close"}\n'),
+                    output_stream=output,
+                    error_stream=io.StringIO(),
+                )
 
-        records = [json.loads(line) for line in output.getvalue().splitlines()]
-        self.assertEqual(0, exit_code)
-        self.assertEqual("logs/session-1.jsonl", records[0]["traceLog"])
-        self.assertEqual(
-            "logs/session-1.jsonl",
-            records[1]["session"]["traceLog"],
-        )
+                records = [
+                    json.loads(line) for line in output.getvalue().splitlines()
+                ]
+                self.assertEqual(0, exit_code)
+                self.assertEqual(expected, records[0]["traceLog"])
+                self.assertEqual(expected, records[1]["session"]["traceLog"])
 
     def test_action_and_session_timing_stays_in_diagnostic_traces(self):
         clock = ManualClock()
