@@ -1,0 +1,1 @@
+"""CLI assembly tests."""

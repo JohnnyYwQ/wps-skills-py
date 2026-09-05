@@ -5,8 +5,10 @@
 # ============================================
 # 私有资料 (不同步到GitHub)
 # ============================================
+docs/
 WPS接口API/
 planplan.md
+CONTEXT.md
 
 
 # 包管理器锁文件 (可选保留)
@@ -86,6 +88,7 @@ local.config.ts
 # ============================================
 # 日志和临时文件
 # ============================================
+build/
 logs/
 logs-old/
 *.log
@@ -151,6 +154,7 @@ api-keys.json
 *.7z
 
 # 调试文件
+
 .debug/
 *.dump
 
@@ -180,8 +184,5 @@ CHANGELOG.md
 
 # Agent file
 AGENTS.md
-CONTEXT.md
 understand.md
-docs/
 fix.md
-

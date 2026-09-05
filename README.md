@@ -1,76 +1,100 @@
-# WPS Skills
+# WPS Automation Foundation
 
-WPS Skills 让任何能加载 Agent Skills 并执行本地 shell 的编排者，通过一个本地 Action Runtime 操作 WPS Excel、PPT 和 Word。编排者拥有 WPS 任务：先查询 Catalog，逐个执行 Action，读取每步结果后再决定下一步。
+This repository contains the shared WPS Action Session foundation and a production Windows Word slice, including an independently installable `wps-word` Application Skill.
 
-## 使用方式
+## What exists
 
-运行环境只需要已有的 Python；Windows 实机运行还需要 Windows PowerShell 和已注册 COM 的 WPS Office。仓内已随附 Linux Excel 后端所需源码；本轮没有改动、重新设计或验收 Linux 后端。
+- An application-scoped `ActionSession` with immutable one-document binding, closed Controller Result handling, exact-document dispatch, and idempotent cleanup.
+- A canonical JSONL `SessionHost` with strict Action Request decoding, lifecycle records, per-Action/session timing journals, traced request rejection, and terminal ordering.
+- A complete, validated Word target Contract Set and compact Action Index for fourteen designed Actions.
+- A production Word Application Contract Set containing thirteen Actions: document create/open; structured write, inspect, find, and replace; table and image insertion; header/footer, page-layout, and break changes; in-place save; and PDF export. Every advertised required Action has a real handler. Only the deferred `saveAs` target Action remains absent.
+- A Session-owned suspended-process launcher with Windows Job Object containment, one lazy native `System32` Windows PowerShell bridge, stable-file-identity acquisition, and a cross-process guard/Lease/quarantine coordinator.
+- Real structured Word writing, including separate Western and East Asian run fonts, plus bounded search/replacement, tables, embedded images, headers/footers, layout, page/section breaks, and PDF export, with revision-aware results and operation-specific read-back verification.
+- Hidden bridge launch at both process layers: Windows creates the child with `CREATE_NO_WINDOW`, and native PowerShell is also given `-WindowStyle Hidden`, so automation does not open a console window.
+- Word establishment makes WPS visible and activates only the exact created or opened document. A newly created WPS application uses normal, not maximized, outer-window state. On either create or attach, a genuinely tiny top-level frame is repaired to a centered 80% of its monitor work area; an already reasonable user window is left alone. Later Actions still dispatch through the retained binding rather than window focus.
+- A `scripts/call.py --session --app word` production entry point on Windows. Excel and PPT remain unavailable and fail before `session.ready`.
+- Side-effect-free `--app word --index` and `--app word --resolve ACTION...` discovery, generated from the production Contract Set.
+- A reusable Python Session Client that preserves terminal Action errors, serializes calls, and separates document results from cleanup outcomes.
+- A Word Skill under `src/main/resources/skills/wps-word`, with task guidance, executable client examples, and standalone assembly.
+- Local fake-driven conformance tests plus ignored bounded Windows/WPS evidence for the real bridge and production Session Host.
 
-先做只读环境报告：
+The previous combined Skill, global Manifest and discovery CLI, multi-application Runtime, WPS controllers, Linux/OpenXML backends, and live harnesses were removed by [ADR 0016](docs/adr/0016-cut-over-without-legacy-runtime-compatibility.md). They are recoverable from Git history but are not compatibility interfaces.
 
-```bash
-python scripts/install.py --check
-```
+## Verify the foundation
 
-每次调用前，先从 Catalog 读取精确的 Action Contract：
-
-```bash
-python scripts/actions.py search chart
-python scripts/actions.py describe setCellValue --app excel
-python scripts/call.py setCellValue --app excel '{"row": 1, "col": 1, "value": 42}'
-```
-
-PowerShell 5.1 推荐传入 JSON 文件，避免命令行转义：
-
-```powershell
-python scripts/call.py addSlide --app ppt --params-file C:\tmp\slide.json
-```
-
-`call.py` 一次只执行一个 Action，并在输出响应前清理本次 Runtime 和 controller。Catalog 仅读取 Manifest，不会初始化 WPS。普通 Action 面向对应应用的活动文档；需要改变目标时，先使用显式的创建、打开、列举或切换 Action。
-
-## 安全与可靠性
-
-- 多 Action 的 WPS 任务由编排者串行提交，并等待每一步 JSON 响应；系统 mutex 只防止不同进程误并发。
-- 先检查 Contract 的 `risk`：只有 `read` Action 在可识别的短暂 COM/RPC 故障后自动重试一次。`write` 或 `destructive` 的不确定结果带 `outcomeUnknown:true`，应先用只读 Action 核验活动文档。
-- `saveAs`、`convertToPDF` 和 `convertFormat` 在目标已存在时默认拒绝；只有明确的 `overwrite:true` 才允许覆盖。
-- 每个响应都有 `traceId` 和 `traceLog`。排障时从该 trace 的末尾向前查看；不要重复提交不确定的写入 Action。
-
-## 验证
-
-无需 Windows 或 WPS 实机即可验证本规格范围：
+Python 3.8 or newer is sufficient:
 
 ```bash
-python scripts/test_ci.py
+PYTHONPATH=src/main/python python -m unittest discover -s src/test/python -p 'test_*.py'
 ```
 
-自动化套件覆盖 Catalog、Manifest、Action CLI、Runtime、mutex、风险策略、三个控制器的静态 Contract、trace 与子进程清理；同时校验 235 个 Action 都已纳入实机套件且默认参数符合 Action Contract。它不会在 GitHub runner 上启动 WPS 或执行 COM 行为。
+The suite exercises local fakes, real subprocess protocol channels, and relocated Skill distributions. No WPS installation or external account is required.
 
-Windows PowerShell bridge 的纯语法回归测试可在不安装 WPS 的 Windows 或
-GitHub Actions `windows-latest` runner 上运行：
+## Build and use the Word Skill
 
-```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File scripts\test_windows_powershell_parse.ps1
+```bash
+python scripts/build_word_skill.py
+python build/skills/wps-word/scripts/word.py --app word --index
+python build/skills/wps-word/scripts/word.py --app word --resolve createDocument writeContent inspectDocument
 ```
 
-在安装了 WPS Office 的 Windows 实机上，可先运行针对近期 bridge bug 的小型回归测试。脚本会创建并关闭一个不保存的测试工作簿：
+The build creates `build/skills/wps-word/`, containing `SKILL.md`, references, the thin `scripts/word.py` entry point, and a snapshot of the Python Runtime and PowerShell resources. Copy this complete directory into the target agent's Skill directory. The source tree remains the only maintained implementation; the build includes a SHA-256 file inventory and refuses to overwrite an existing destination. Use `--output <new-directory>/wps-word` for another build.
 
-```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File scripts\test_windows_wps_regressions.ps1
+Read [the Word Skill](src/main/resources/skills/wps-word/SKILL.md) for document intent, discovery, execution, verification, persistence, and failure handling. Its [Session guide](src/main/resources/skills/wps-word/references/session.md) includes a Python task example using `open_session()` and `client.call(address, params)`; the caller decides each next Action after the prior response. Discovery works on macOS/Linux too, while document execution runs on the Windows WPS host.
+
+The source Skill's `scripts/word.py` also works directly from its source location. A deployed Skill uses its bundled Runtime and requires no repository checkout or third-party Python package.
+
+On the Windows WPS host, start a Word Session with:
+
+```bash
+python scripts/call.py --session --app word
 ```
 
-如需保留导出的 PNG 供人工检查，附加 `-KeepArtifacts`。
+The Host emits `session.ready`, accepts newline-delimited Action Requests, and reuses one exact live Word document and one bridge until `{"control":"close"}`. `saveAs` remains outside the production Contract Set because its gap-free destination Lease migration is still deferred.
 
-要按 Bridge、Excel、PPT、Word 场景执行全部 235 个 Action，运行：
+Protocol v1 remains closed: timing is diagnostic rather than an extra Action Response field. The `traceLog` in each Action Response records that Action's `elapsedMs`; the Session `traceLog` ends with `sessionElapsedMs`, `actionExecutionElapsedMs`, `cleanupElapsedMs`, and `actionCount` so wall time and actual Action execution are not confused.
 
-```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File scripts\test_windows_wps_all_actions.ps1
+Normal Session cleanup deliberately leaves the document open. A controlled debug run that creates disposable content may opt into test-only cleanup:
+
+```bash
+python scripts/call.py --session --app word --debug-close-created-document
 ```
 
-默认会执行包括 PPT 文本选择和放映在内的全部 Action。测试前先保存或关闭无关 WPS 文档，运行期间不要手动切换活动文档。结果写入 `test-results\wps-full-<时间>`，其中：
+That flag discards and closes only a document created by that Session. It never closes a document acquired through `openDocument`, is not a Word Action, and must not be used when the newly created document contains content that should be retained.
 
-- `report.json`：完整汇总、参数、响应和效果断言；
-- `failures.log`：适合直接复制或发回的失败摘要；
-- `actions.jsonl`：逐项追加的原始执行记录，即使中途异常也能保留；
-- `traces\`：能够收集到的 Action trace 副本。
+## Project layout
 
-如果当前机器不方便自动选择 PPT 文本或启动放映，可附加 `-SkipInteractive`；这些 Action 会明确记为 `skip`，不会被伪装成通过。WPS Word 当前没有 `closeDocument` Action，因此脚本不会越过 Action Contract 自动关闭生成的 Word 文档，检查完成后由执行者关闭。
+The repository uses Java-style source sets while retaining Python packages:
+
+```text
+src/
+  main/
+    python/wps_skills/
+      cli/          # production assembly
+      client/       # caller-side Session Protocol and process lifetime
+      core/         # application-independent Action Session Core
+      host/         # JSONL Session Host
+      word/         # Word contracts, handlers, and Adapter
+      windows/      # Windows process, coordination, and bridge adapters
+    resources/
+      wps_skills/word/windows/  # PowerShell/WPS bridge and Action resources
+      skills/wps-word/         # Skill source, references, and thin entry point
+  test/
+    python/tests/   # tests mirror the production modules
+    resources/      # non-production capability evidence
+scripts/            # thin repository entry points only
+docs/               # domain docs, ADRs, and implementation notes
+build/              # ignored logs, probes, and test output
+```
+
+Tests use a separate `tests` namespace because a second top-level Python package named `wps_skills` would shadow the production package during discovery.
+
+## Design sources
+
+- `CONTEXT.md` defines canonical domain language.
+- `docs/adr/` records active architecture decisions.
+- `docs/word-action-contracts.md` distinguishes the fourteen-Action Target Contract Portfolio from the thirteen-Action production Application Contract Set.
+- `docs/word-adapter-boundary.md` describes the Adapter/Backend, process ownership, and coordination seams.
+- `docs/word-action-migration.md` preserves the historical Word capability inventory and future migration evidence.
+- `docs/adr/0019-use-java-style-source-sets-around-python-packages.md` records the source-set and Python namespace trade-off.
+- `src/test/resources/wps_skills/word/type_library/wps_writer_api.py` is capability evidence only and is never imported by the Runtime.

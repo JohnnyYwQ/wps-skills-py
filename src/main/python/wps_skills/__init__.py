@@ -1,0 +1,1 @@
+"""WPS application automation modules."""

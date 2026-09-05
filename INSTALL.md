@@ -1,42 +1,83 @@
-# WPS Skill 环境说明
+# Windows Word Session Setup
 
-此 Skill 没有仓外运行时依赖，也没有安装步骤。它面向能够加载 Agent Skills 并执行本地 shell 的编排者；不要求特定宿主、私有 API、全局工具注册或直接导入 Python 模块。
+The repository contains a production Windows Word Session Host and Adapter for a thirteen-Action surface, plus a standalone Word Application Skill. Document execution runs directly on the Windows machine that has WPS; there is no separate Windows Host service to install.
 
-## 前置条件
+## Requirements
 
-- Python 3.8 或更高版本。
-- Windows 实机运行：Windows PowerShell 与已安装、已注册 COM 的 WPS Office。所需 ProgID 为 `Ket.Application`、`Kwpp.Application` 与 `Kwps.Application`。
-- Linux 后端及其仓内源码依赖保持原样，但不属于本轮实机验收范围。
+- Python 3.8 or newer.
+- Windows with WPS Writer registered as `KWPS.Application`.
+- Native Windows PowerShell under `%WINDIR%\System32\WindowsPowerShell\v1.0\powershell.exe`. The Runtime does not fall back to the slower WOW64 host.
+- No third-party Python package or external service.
 
-环境入口只报告状态，不会修改系统、下载内容或创建运行环境：
+The local unit suite itself does not start WPS, COM, or PowerShell.
 
-```bash
-python scripts/install.py --check
-```
+## Assemble and install the Skill
 
-## 加载后工作流
-
-1. 编排者加载根目录 `SKILL.md`。
-2. 在 shell 中使用 `scripts/actions.py` 搜索和读取 Action Contract。
-3. 使用 `scripts/call.py` 执行一个 Action，等待 JSON 响应后再提交下一步。
-4. 记录每次响应的 `traceId`；发生不确定的写入结果时，先用只读 Action 检查活动文档。
-
-示例：
+From the repository root:
 
 ```bash
-python scripts/actions.py describe findReplace --app word
-python scripts/call.py findReplace --app word --params-file C:\tmp\replace.json
+python scripts/build_word_skill.py --output build/skills/wps-word
 ```
 
-每个 CLI 调用都有独立 Runtime 与清理边界，不会关闭 WPS 应用、活动文档或未保存内容。跨进程 mutex 会等待冲突调用结束；编排者仍必须自行维持 Action 的业务顺序。
+The destination must not already exist. The complete output has this layout:
 
-## 本地验证
+```text
+wps-word/
+  SKILL.md
+  agents/openai.yaml
+  references/
+  scripts/word.py
+  runtime/
+    files.sha256.json
+    src/main/python/wps_skills/
+    src/main/resources/wps_skills/word/windows/
+```
 
-以下检查不要求 Windows 或 WPS：
+Copy the complete `wps-word` directory to the Skill location supported by the target agent. Do not install only `SKILL.md` or only the source resources directory: the deployed entry point needs the bundled Runtime. To use this Skill on another execution host, place the complete directory on that host too and use that host's paths. No machine names, SSH credentials, or scheduled tasks are embedded.
+
+Verify installation without starting WPS:
+
+```powershell
+python "C:\path\to\wps-word\scripts\word.py" --app word --index
+python "C:\path\to\wps-word\scripts\word.py" --app word --resolve openDocument inspectDocument writeContent save
+```
+
+Successful resolution exits 0; a `partial` or `failed` batch exits 2 while still reporting every requested Action. An unavailable application exits 4 without publishing another application's contracts.
+
+Follow `SKILL.md` and `references/session.md` to execute a task with the Python Session Client. If visible WPS output is needed, execute in the logged-in user's desktop session. SSH execution by itself does not establish desktop visibility; remote desktop launch is environment-specific and is not part of the Skill installer.
+
+## Local verification
+
+From the repository root, run:
 
 ```bash
-python scripts/validate_action_manifest.py
-python -m unittest discover -s bridge -p 'test_*.py'
+PYTHONPATH=src/main/python python -m unittest discover -s src/test/python -p 'test_*.py'
 ```
 
-真实 WPS 的功能验收只应在目标 Windows 环境进行；Linux 后端不因本轮架构收缩而被视为已验收。
+In Windows PowerShell, set the same source root with:
+
+```powershell
+$env:PYTHONPATH = "src/main/python"
+python -m unittest discover -s src/test/python -p "test_*.py"
+```
+
+## Windows production Session
+
+Run this command inside the repository on the Windows WPS machine:
+
+```bash
+python scripts/call.py --session --app word
+```
+
+It emits `session.ready` on stdout, then accepts strict JSONL Action Requests. A normal existing-file flow is `openDocument`, any supported required Actions, final `inspectDocument`, explicit `save` when Persistence Intent requires it, then `{"control":"close"}`. The production Set also supports `findContent`, `replaceContent`, `insertTable`, `insertImage`, `setHeaderFooter`, `setPageLayout`, `insertBreak`, and `exportPdf`; only `saveAs` remains deferred. The Runtime keeps one exact document and one owned, console-hidden PowerShell bridge for the full Session. Excel and PPT still fail construction before `session.ready`.
+
+## Admitting more capability
+
+An additional Word target Action, or a future Excel/PPT slice, is admitted only after it owns all of the following:
+
+1. A complete Application Contract Set and generated Action Index.
+2. An exact-document Application Adapter and controller at the shared seam.
+3. Binding, persistence, handler, and real-WPS verification evidence.
+4. Its own independently discoverable Application Skill.
+
+Do not add a placeholder Skill, empty production Contract Set, fake production Adapter, global Action Manifest, or compatibility wrapper around the removed execution model.

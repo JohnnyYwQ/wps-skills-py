@@ -1,0 +1,4 @@
+interface:
+  display_name: "WPS Word"
+  short_description: "在 Windows WPS 中编辑、验证 Word 文档并保存已有文件或导出 PDF"
+  default_prompt: "使用 $wps-word 完成这个 Word 文档任务，验证结果并说明保存状态。"
