@@ -1,5 +1,7 @@
 # WPS Automation Foundation
 
+[English](README.md) | [简体中文](README.zh-CN.md)
+
 This repository contains the shared WPS Action Session foundation and a production Windows Word slice, including an independently installable `wps-word` Application Skill.
 
 ## What exists
@@ -16,9 +18,9 @@ This repository contains the shared WPS Action Session foundation and a producti
 - Side-effect-free `--app word --index` and `--app word --resolve ACTION...` discovery, generated from the production Contract Set.
 - A reusable Python Session Client that preserves terminal Action errors, serializes calls, and separates document results from cleanup outcomes.
 - A Word Skill under `src/main/resources/skills/wps-word`, with task guidance, executable client examples, and standalone assembly.
-- Local fake-driven conformance tests plus ignored bounded Windows/WPS evidence for the real bridge and production Session Host.
+- Local conformance tests for the Session Core, protocol channels, and standalone Skill packaging.
 
-The previous combined Skill, global Manifest and discovery CLI, multi-application Runtime, WPS controllers, Linux/OpenXML backends, and live harnesses were removed by [ADR 0016](docs/adr/0016-cut-over-without-legacy-runtime-compatibility.md). They are recoverable from Git history but are not compatibility interfaces.
+The previous combined Skill, global Manifest and discovery CLI, multi-application Runtime, WPS controllers, Linux/OpenXML backends, and live harnesses have been removed. They are recoverable from Git history but are not compatibility interfaces.
 
 ## Verify the foundation
 
@@ -33,12 +35,12 @@ The suite exercises local fakes, real subprocess protocol channels, and relocate
 ## Build and use the Word Skill
 
 ```bash
-python scripts/build_word_skill.py
-python build/skills/wps-word/scripts/word.py --app word --index
-python build/skills/wps-word/scripts/word.py --app word --resolve createDocument writeContent inspectDocument
+python scripts/build_word_skill.py --output "<output-dir>/wps-word"
+python "<output-dir>/wps-word/scripts/word.py" --app word --index
+python "<output-dir>/wps-word/scripts/word.py" --app word --resolve createDocument writeContent inspectDocument
 ```
 
-The build creates `build/skills/wps-word/`, containing `SKILL.md`, references, the thin `scripts/word.py` entry point, and a snapshot of the Python Runtime and PowerShell resources. Copy this complete directory into the target agent's Skill directory. The source tree remains the only maintained implementation; the build includes a SHA-256 file inventory and refuses to overwrite an existing destination. Use `--output <new-directory>/wps-word` for another build.
+Replace `<output-dir>` with your chosen output directory. The build creates a `wps-word/` directory containing `SKILL.md`, references, the thin `scripts/word.py` entry point, and a snapshot of the Python Runtime and PowerShell resources. Copy this complete directory into the target agent's Skill directory. The source tree remains the only maintained implementation; the build includes a SHA-256 file inventory and refuses to overwrite an existing destination. Use `--output <new-directory>/wps-word` for another build.
 
 Read [the Word Skill](src/main/resources/skills/wps-word/SKILL.md) for document intent, discovery, execution, verification, persistence, and failure handling. Its [Session guide](src/main/resources/skills/wps-word/references/session.md) includes a Python task example using `open_session()` and `client.call(address, params)`; the caller decides each next Action after the prior response. Discovery works on macOS/Linux too, while document execution runs on the Windows WPS host.
 
@@ -83,18 +85,15 @@ src/
     python/tests/   # tests mirror the production modules
     resources/      # non-production capability evidence
 scripts/            # thin repository entry points only
-docs/               # domain docs, ADRs, and implementation notes
-build/              # ignored logs, probes, and test output
 ```
 
 Tests use a separate `tests` namespace because a second top-level Python package named `wps_skills` would shadow the production package during discovery.
 
-## Design sources
+## Skill and capability references
 
-- `CONTEXT.md` defines canonical domain language.
-- `docs/adr/` records active architecture decisions.
-- `docs/word-action-contracts.md` distinguishes the fourteen-Action Target Contract Portfolio from the thirteen-Action production Application Contract Set.
-- `docs/word-adapter-boundary.md` describes the Adapter/Backend, process ownership, and coordination seams.
-- `docs/word-action-migration.md` preserves the historical Word capability inventory and future migration evidence.
-- `docs/adr/0019-use-java-style-source-sets-around-python-packages.md` records the source-set and Python namespace trade-off.
-- `src/test/resources/wps_skills/word/type_library/wps_writer_api.py` is capability evidence only and is never imported by the Runtime.
+- [Word Skill](src/main/resources/skills/wps-word/SKILL.md): task workflow and capability discovery.
+- [Session guide](src/main/resources/skills/wps-word/references/session.md): Python client usage and a runnable example.
+- [Content guide](src/main/resources/skills/wps-word/references/content.md): ranges, revisions, text formatting, and units.
+- [Verification guide](src/main/resources/skills/wps-word/references/verification.md): verification, persistence, and failure handling.
+- [Word contracts](src/main/python/wps_skills/word/contracts.py): authoritative Action definitions and the derived production Contract Set.
+- [WPS Writer Type Library snapshot](src/test/resources/wps_skills/word/type_library/wps_writer_api.py): capability evidence only; never imported by the Runtime.
